@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from SmartApi import SmartConnect
 
 # ================= SETTINGS (sirf yahan badlav karein) =================
-WATCHLIST  = ["LODHA"]       # NSE symbols, jaise ["LODHA", "RELIANCE", "TCS"]
+WATCHLIST  = ["LODHA", "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "BSE", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO"]
 TIMEFRAMES = [5, 15]         # minutes me: 1, 3, 5, 10, 15, 30
 FAST, SLOW = 9, 21           # EMA periods
 # =======================================================================
