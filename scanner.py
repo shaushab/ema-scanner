@@ -18,24 +18,33 @@ SCRIP_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAP
 
 
 def secret(name):
-    # space, nayi line, tab sab hata deta hai
     return "".join(os.environ.get(name, "").split())
 
 
-API_KEY   = secret("ANGEL_API_KEY")
-CLIENT    = secret("ANGEL_CLIENT_CODE").upper()
-PIN       = secret("ANGEL_PIN")
-TOTP_KEY  = secret("ANGEL_TOTP_SECRET").upper()
-TG_TOKEN  = secret("TG_BOT_TOKEN")
-TG_CHAT   = secret("TG_CHAT_ID")
+API_KEY  = secret("ANGEL_API_KEY")
+CLIENT   = secret("ANGEL_CLIENT_CODE").upper()
+PIN      = secret("ANGEL_PIN")
+TOTP_KEY = secret("ANGEL_TOTP_SECRET").upper()
+TG_TOKEN = secret("TG_BOT_TOKEN")
+TG_CHAT  = secret("TG_CHAT_ID")
 
 
 def tg(text):
-    try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": TG_CHAT, "text": text[:4000]}, timeout=15)
-    except Exception as e:
-        print("Telegram error:", e)
+    # lamba message ho toh 3500 character ke hisson me bhejo
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(cur) + len(line) + 1 > 3500:
+            parts.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur.strip():
+        parts.append(cur)
+    for p in parts:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          data={"chat_id": TG_CHAT, "text": p}, timeout=15)
+        except Exception as e:
+            print("Telegram error:", e)
 
 
 def login():
@@ -49,8 +58,9 @@ def login():
 def get_tokens():
     data = requests.get(SCRIP_URL, timeout=90).json()
     want = {f"{s.upper()}-EQ": s.upper() for s in WATCHLIST}
-    return {want[r["symbol"]]: r["token"] for r in data
-            if r.get("exch_seg") == "NSE" and r.get("symbol") in want}
+    found = {want[r["symbol"]]: r["token"] for r in data
+             if r.get("exch_seg") == "NSE" and r.get("symbol") in want}
+    return {s.upper(): found[s.upper()] for s in WATCHLIST if s.upper() in found}
 
 
 def ema(values, n):
@@ -94,8 +104,8 @@ def check(api, sym, token, tf, seen, startup=False):
         if not startup:
             tg(f"{signal}\n{sym} | {tf}m candle {t:%d-%b %H:%M}\n"
                f"Close: {closes[-1]:.2f}\nEMA{FAST}: {f[-1]:.2f} | EMA{SLOW}: {s[-1]:.2f}")
-    side = ">" if f[-1] > s[-1] else "<"
-    return f"{sym} {tf}m: close {closes[-1]:.2f} | EMA{FAST} {f[-1]:.2f} {side} EMA{SLOW} {s[-1]:.2f}"
+    dot = "🟢" if f[-1] > s[-1] else "🔴"
+    return f"{dot} {sym} {tf}m: {closes[-1]:.2f}"
 
 
 def main():
@@ -107,11 +117,11 @@ def main():
     for sym, tok in tokens.items():
         for tf in TIMEFRAMES:
             try:
-                lines.append(check(api, sym, tok, tf, seen, startup=True) or f"{sym} {tf}m: data nahi mila")
+                lines.append(check(api, sym, tok, tf, seen, startup=True) or f"⚪ {sym} {tf}m: data nahi mila")
             except Exception as e:
-                lines.append(f"{sym} {tf}m: error {e}")
+                lines.append(f"⚠️ {sym} {tf}m: error {e}")
             time.sleep(0.5)
-    msg = "✅ EMA scanner chalu ho gaya\n" + "\n".join(lines)
+    msg = f"✅ EMA scanner chalu ho gaya ({len(tokens)} shares)\n" + "\n".join(lines)
     if missing:
         msg += "\n⚠️ Ye symbol nahi mile: " + ", ".join(missing)
     tg(msg)
