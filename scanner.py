@@ -1,4 +1,4 @@
-import os, time, requests, pyotp
+import os, time, traceback, requests, pyotp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from SmartApi import SmartConnect
@@ -15,21 +15,32 @@ INTERVALS = {1: "ONE_MINUTE", 3: "THREE_MINUTE", 5: "FIVE_MINUTE",
 HISTORY_DAYS = {1: 3, 3: 5, 5: 7, 10: 10, 15: 15, 30: 25}
 MAX_RUN_MIN = 345
 SCRIP_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-env = os.environ
+
+
+def secret(name):
+    # space, nayi line, tab sab hata deta hai
+    return "".join(os.environ.get(name, "").split())
+
+
+API_KEY   = secret("ANGEL_API_KEY")
+CLIENT    = secret("ANGEL_CLIENT_CODE").upper()
+PIN       = secret("ANGEL_PIN")
+TOTP_KEY  = secret("ANGEL_TOTP_SECRET").upper()
+TG_TOKEN  = secret("TG_BOT_TOKEN")
+TG_CHAT   = secret("TG_CHAT_ID")
 
 
 def tg(text):
     try:
-        requests.post(f"https://api.telegram.org/bot{env['TG_BOT_TOKEN']}/sendMessage",
-                      data={"chat_id": env["TG_CHAT_ID"], "text": text}, timeout=15)
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      data={"chat_id": TG_CHAT, "text": text[:4000]}, timeout=15)
     except Exception as e:
         print("Telegram error:", e)
 
 
 def login():
-    api = SmartConnect(api_key=env["ANGEL_API_KEY"])
-    totp = pyotp.TOTP("".join(env["ANGEL_TOTP_SECRET"].split()).upper()).now()
-    res = api.generateSession(env["ANGEL_CLIENT_CODE"], env["ANGEL_PIN"], totp)
+    api = SmartConnect(api_key=API_KEY)
+    res = api.generateSession(CLIENT, PIN, pyotp.TOTP(TOTP_KEY).now())
     if not res or not res.get("status"):
         raise RuntimeError(f"Angel One login failed: {res}")
     return api
@@ -60,7 +71,7 @@ def candles(api, token, tf):
     out = []
     for r in rows:
         t = datetime.fromisoformat(r[0])
-        if t + timedelta(minutes=tf) <= now:
+        if t + timedelta(minutes=tf) <= now:      # sirf poori bani candles
             out.append((t, float(r[4])))
     return out
 
@@ -134,4 +145,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        tg(f"❌ EMA scanner error:\n{e}")
+        traceback.print_exc()
+        raise
