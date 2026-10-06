@@ -28,7 +28,7 @@ def tg(text):
 
 def login():
     api = SmartConnect(api_key=env["ANGEL_API_KEY"])
-    totp = pyotp.TOTP(env["ANGEL_TOTP_SECRET"]).now()
+    totp = pyotp.TOTP("".join(env["ANGEL_TOTP_SECRET"].split()).upper()).now()
     res = api.generateSession(env["ANGEL_CLIENT_CODE"], env["ANGEL_PIN"], totp)
     if not res or not res.get("status"):
         raise RuntimeError(f"Angel One login failed: {res}")
