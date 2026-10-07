@@ -4,9 +4,13 @@ from zoneinfo import ZoneInfo
 from SmartApi import SmartConnect
 
 # ================= SETTINGS (sirf yahan badlav karein) =================
-WATCHLIST  = ["LODHA", "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "BSE", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO"]
-TIMEFRAMES = [5, 15]         # minutes me: 1, 3, 5, 10, 15, 30
-FAST, SLOW = 9, 21           # EMA periods
+FIXED       = ["LODHA"]      # ye shares hamesha scan honge
+TOP_N       = 5              # kitne top gainers aur kitne top losers
+TIMEFRAMES  = [5, 15]        # minutes me: 1, 3, 5, 10, 15, 30
+FAST, SLOW  = 9, 21          # EMA periods
+RR          = 2              # target = risk x 2  (1:2)
+REFRESH_MIN = 30             # gainers/losers list har kitne minute me update ho
+UNIVERSE    = ["ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "BSE", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO"]
 # =======================================================================
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -30,7 +34,6 @@ TG_CHAT  = secret("TG_CHAT_ID")
 
 
 def tg(text):
-    # lamba message ho toh 3500 character ke hisson me bhejo
     parts, cur = [], ""
     for line in text.split("\n"):
         if len(cur) + len(line) + 1 > 3500:
@@ -55,12 +58,11 @@ def login():
     return api
 
 
-def get_tokens():
+def get_tokens(symbols):
     data = requests.get(SCRIP_URL, timeout=90).json()
-    want = {f"{s.upper()}-EQ": s.upper() for s in WATCHLIST}
-    found = {want[r["symbol"]]: r["token"] for r in data
-             if r.get("exch_seg") == "NSE" and r.get("symbol") in want}
-    return {s.upper(): found[s.upper()] for s in WATCHLIST if s.upper() in found}
+    want = {f"{s.upper()}-EQ": s.upper() for s in symbols}
+    return {want[r["symbol"]]: r["token"] for r in data
+            if r.get("exch_seg") == "NSE" and r.get("symbol") in want}
 
 
 def ema(values, n):
@@ -82,49 +84,93 @@ def candles(api, token, tf):
     for r in rows:
         t = datetime.fromisoformat(r[0])
         if t + timedelta(minutes=tf) <= now:      # sirf poori bani candles
-            out.append((t, float(r[4])))
+            out.append((t, float(r[1]), float(r[2]), float(r[3]), float(r[4])))
     return out
 
 
-def check(api, sym, token, tf, seen, startup=False):
+def movers(api, tokens):
+    """Nifty 50 me se top gainers aur top losers (% change)"""
+    pct = {}
+    try:
+        res = api.getMarketData("FULL", {"NSE": [tokens[s] for s in UNIVERSE if s in tokens]})
+        for d in ((res or {}).get("data") or {}).get("fetched") or []:
+            sym = str(d.get("tradingSymbol", ""))
+            if sym.endswith("-EQ"):
+                sym = sym[:-3]
+            if sym in UNIVERSE and d.get("percentChange") is not None:
+                pct[sym] = float(d["percentChange"])
+    except Exception as e:
+        print("getMarketData failed:", e)
+    if len(pct) < 2 * TOP_N:                      # backup tarika: daily candles
+        now = datetime.now(IST)
+        for sym in UNIVERSE:
+            if sym not in tokens or sym in pct:
+                continue
+            try:
+                r = api.getCandleData({
+                    "exchange": "NSE", "symboltoken": tokens[sym], "interval": "ONE_DAY",
+                    "fromdate": (now - timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
+                    "todate": now.strftime("%Y-%m-%d %H:%M")})
+                rows = (r or {}).get("data") or []
+                if len(rows) >= 2:
+                    pct[sym] = (float(rows[-1][4]) / float(rows[-2][4]) - 1) * 100
+            except Exception as e:
+                print("Daily candle error", sym, e)
+            time.sleep(0.4)
+    ranked = sorted(pct.items(), key=lambda x: x[1], reverse=True)
+    return ranked[:TOP_N], list(reversed(ranked[-TOP_N:]))
+
+
+def check(api, sym, token, tf, seen):
     c = candles(api, token, tf)
     if len(c) < SLOW + 5:
-        return None
-    closes = [x[1] for x in c]
+        return
+    closes = [x[4] for x in c]
     f, s = ema(closes, FAST), ema(closes, SLOW)
-    t = c[-1][0]
-    signal = None
-    if f[-2] <= s[-2] and f[-1] > s[-1]:
-        signal = f"🟢 BULLISH: EMA{FAST} ne EMA{SLOW} ko upar cross kiya"
-    elif f[-2] >= s[-2] and f[-1] < s[-1]:
-        signal = f"🔴 BEARISH: EMA{FAST} ne EMA{SLOW} ko neeche cross kiya"
+    t, o, h, l, cl = c[-1]
+    now = datetime.now(IST)
+    if now - (t + timedelta(minutes=tf)) > timedelta(minutes=3):
+        return                                    # purani candle, alert nahi
+    bull = f[-2] <= s[-2] and f[-1] > s[-1]
+    bear = f[-2] >= s[-2] and f[-1] < s[-1]
     key = (sym, tf, t)
-    if signal and key not in seen:
-        seen.add(key)
-        if not startup:
-            tg(f"{signal}\n{sym} | {tf}m candle {t:%d-%b %H:%M}\n"
-               f"Close: {closes[-1]:.2f}\nEMA{FAST}: {f[-1]:.2f} | EMA{SLOW}: {s[-1]:.2f}")
-    dot = "🟢" if f[-1] > s[-1] else "🔴"
-    return f"{dot} {sym} {tf}m: {closes[-1]:.2f}"
+    if not (bull or bear) or key in seen:
+        return
+    seen.add(key)
+    min_risk = cl * 0.003                         # risk kam se kam 0.3%
+    if bull:
+        sl = min(l, cl - min_risk)
+        tgt = cl + RR * (cl - sl)
+        head = f"🟢 BULLISH (BUY): EMA{FAST} ne EMA{SLOW} ko upar cross kiya"
+    else:
+        sl = max(h, cl + min_risk)
+        tgt = cl - RR * (sl - cl)
+        head = f"🔴 BEARISH (SELL): EMA{FAST} ne EMA{SLOW} ko neeche cross kiya"
+    tg(f"{head}\n{sym} | {tf}m candle {t:%d-%b %H:%M}\n"
+       f"Entry: {cl:.2f}\nStop Loss: {sl:.2f}\nTarget (1:{RR}): {tgt:.2f}")
+
+
+def build_watch(api, tokens, title):
+    g, l = movers(api, tokens)
+    watch = [s for s in FIXED if s in tokens] + [x[0] for x in g] + [x[0] for x in l]
+    watch = list(dict.fromkeys(watch))
+    msg = f"{title}\n📌 Fixed: {', '.join(FIXED)}\n\n📈 Top Gainers:\n"
+    msg += "\n".join(f"{s} {p:+.2f}%" for s, p in g)
+    msg += "\n\n📉 Top Losers:\n" + "\n".join(f"{s} {p:+.2f}%" for s, p in l)
+    return watch, msg
 
 
 def main():
     start = time.time()
-    tokens = get_tokens()
-    missing = [s for s in WATCHLIST if s.upper() not in tokens]
+    tokens = get_tokens(FIXED + UNIVERSE)
+    missing = [s for s in FIXED + UNIVERSE if s.upper() not in tokens]
     api = login()
-    seen, lines = set(), []
-    for sym, tok in tokens.items():
-        for tf in TIMEFRAMES:
-            try:
-                lines.append(check(api, sym, tok, tf, seen, startup=True) or f"⚪ {sym} {tf}m: data nahi mila")
-            except Exception as e:
-                lines.append(f"⚠️ {sym} {tf}m: error {e}")
-            time.sleep(0.5)
-    msg = f"✅ EMA scanner chalu ho gaya ({len(tokens)} shares)\n" + "\n".join(lines)
+    seen = set()
+    watch, msg = build_watch(api, tokens, "✅ EMA scanner chalu ho gaya")
     if missing:
-        msg += "\n⚠️ Ye symbol nahi mile: " + ", ".join(missing)
+        msg += "\n\n⚠️ Ye symbol nahi mile: " + ", ".join(missing)
     tg(msg)
+    last_refresh = datetime.now(IST)
 
     while time.time() - start < MAX_RUN_MIN * 60:
         now = datetime.now(IST)
@@ -137,13 +183,27 @@ def main():
         now = datetime.now(IST)
         if now < mopen + timedelta(minutes=1):
             continue
+
+        # gainers/losers list update (9:20 ke baad, phir har REFRESH_MIN minute)
+        first_open = mopen + timedelta(minutes=5)
+        if now >= first_open and (last_refresh < first_open or
+                                  now - last_refresh >= timedelta(minutes=REFRESH_MIN)):
+            try:
+                new_watch, msg = build_watch(api, tokens, "🔄 Gainers/Losers list update")
+                if set(new_watch) != set(watch):
+                    tg(msg)
+                watch = new_watch
+            except Exception as e:
+                print("Movers update error:", e)
+            last_refresh = now
+
         mins = int((now - mopen).total_seconds() // 60)
         for tf in TIMEFRAMES:
             if mins % tf:
                 continue
-            for sym, tok in tokens.items():
+            for sym in watch:
                 try:
-                    check(api, sym, tok, tf, seen)
+                    check(api, sym, tokens[sym], tf, seen)
                 except Exception as e:
                     print("Error", sym, tf, e)
                     try:
