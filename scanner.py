@@ -10,7 +10,7 @@ from SmartApi import SmartConnect
 # ================= SETTINGS (sirf yahan badlav karein) =================
 FIXED       = ["LODHA"]      # ye shares hamesha scan honge
 TOP_N       = 5              # kitne top gainers aur kitne top losers
-TIMEFRAMES  = [5, 15]        # minutes me: 1, 3, 5, 10, 15, 30
+TIMEFRAMES  = [5]        # minutes me: 1, 3, 5, 10, 15, 30
 FAST, SLOW  = 9, 21          # EMA periods
 RR          = 2              # target = risk x 2  (1:2)
 REFRESH_MIN = 30             # gainers/losers list har kitne minute me update ho
