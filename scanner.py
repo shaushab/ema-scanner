@@ -10,11 +10,12 @@ from SmartApi import SmartConnect
 # ================= SETTINGS (sirf yahan badlav karein) =================
 FIXED       = ["LODHA"]      # ye shares hamesha scan honge
 TOP_N       = 5              # kitne top gainers aur kitne top losers
-TIMEFRAMES  = [5]        # minutes me: 1, 3, 5, 10, 15, 30
+TIMEFRAMES  = [5]            # minutes me: 1, 3, 5, 10, 15, 30
 FAST, SLOW  = 9, 21          # EMA periods
 RR          = 2              # target = risk x 2  (1:2)
 REFRESH_MIN = 30             # gainers/losers list har kitne minute me update ho
 BIG_EMOJI   = True           # alert se pehle bada 🚀 / 🔻 emoji
+MAX_LATE    = 20             # data late aaye toh bhi itne minute tak ka crossover pakdo
 UNIVERSE    = ["ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "BSE", "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO", "HINDUNILVR", "ICICIBANK", "INDIGO", "INFY", "ITC", "JIOFIN", "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH", "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TMPV", "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO"]
 # =======================================================================
 
@@ -264,18 +265,27 @@ def check(api, sym, token, tf, seen, trades):
                    f"Entry {tr['entry']:.2f} → Abhi {closes[-1]:.2f}  ({pnl:+.2f} / share)",
                    as_html=True, reply_to=tr["mid"])
 
-    # --- naya crossover ---
-    t, o, h, l, cl, vol = c[-1]
+    # --- naya crossover (aakhri 4 candles check, taaki data late aaye toh bhi miss na ho) ---
     now = datetime.now(IST)
-    if now - (t + timedelta(minutes=tf)) > timedelta(minutes=3):
-        return                                    # purani candle, alert nahi
-    bull = f[-2] <= s[-2] and f[-1] > s[-1]
-    bear = f[-2] >= s[-2] and f[-1] < s[-1]
-    key = (sym, tf, t)
-    if not (bull or bear) or key in seen:
-        return
-    seen.add(key)
+    for idx in range(max(1, len(c) - 4), len(c)):
+        t = c[idx][0]
+        if t.date() != now.date():
+            continue
+        if now - (t + timedelta(minutes=tf)) > timedelta(minutes=MAX_LATE):
+            continue
+        bull = f[idx - 1] <= s[idx - 1] and f[idx] > s[idx]
+        bear = f[idx - 1] >= s[idx - 1] and f[idx] < s[idx]
+        key = (sym, tf, t)
+        if (bull or bear) and key not in seen:
+            seen.add(key)
+            send_signal(sym, tf, c[:idx + 1], f[:idx + 1], s[:idx + 1], bull, trades, c[-1][4], now)
 
+
+def send_signal(sym, tf, c, f, s, bull, trades, ltp, now):
+    hs = html.escape(sym)
+    closes = [x[4] for x in c]
+    t, o, h, l, cl, vol = c[-1]
+    bear = not bull
     min_risk = cl * 0.003                         # risk kam se kam 0.3%
     if bull:
         side, sl = "BUY", min(l, cl - min_risk)
@@ -306,6 +316,12 @@ def check(api, sym, token, tf, seen, trades):
         notes.append(f"ℹ️ RSI {r:.0f}")
     star_txt = "⭐" * stars + "☆" * (4 - stars)
 
+    close_time = t + timedelta(minutes=tf)
+    late = int((now - close_time).total_seconds() // 60)
+    timing = f"⏱ Candle close {close_time:%H:%M} | Alert {now:%H:%M}"
+    if late >= 3:
+        timing += f"\n⚠️ Data {late} min late aaya — abhi price {ltp:.2f}"
+
     risk = abs(cl - sl)
     pct = lambda a: abs(a - cl) / cl * 100
     if bull:
@@ -316,7 +332,7 @@ def check(api, sym, token, tf, seen, trades):
         line = f"EMA{FAST} ne EMA{SLOW} ko ⬇️ neeche cross kiya"
     caption = (f"{head}\n"
                f"<b>{hs}</b> • {tf}m • {t:%d-%b %H:%M}\n"
-               f"{line}\n\n"
+               f"{line}\n{timing}\n\n"
                f"💰 Entry:  <code>{cl:.2f}</code>\n"
                f"🛑 SL:     <code>{sl:.2f}</code>  (-{pct(sl):.2f}%)\n"
                f"🎯 Target: <code>{tgt:.2f}</code>  (+{pct(tgt):.2f}%)\n"
@@ -385,7 +401,7 @@ def main():
         mclose = now.replace(hour=15, minute=30, second=0, microsecond=0)
         if now.weekday() >= 5 or now > mclose + timedelta(minutes=2):
             break
-        nxt = (now + timedelta(minutes=1)).replace(second=5, microsecond=0)
+        nxt = (now + timedelta(minutes=1)).replace(second=20, microsecond=0)
         time.sleep(max(1, (nxt - datetime.now(IST)).total_seconds()))
         now = datetime.now(IST)
         if now < mopen + timedelta(minutes=1):
@@ -406,10 +422,7 @@ def main():
 
         open_syms = [t["sym"] for t in trades if t["status"] == "OPEN"]
         scan = list(dict.fromkeys(watch + open_syms))
-        mins = int((now - mopen).total_seconds() // 60)
-        for tf in TIMEFRAMES:
-            if mins % tf:
-                continue
+        for tf in TIMEFRAMES:                     # har minute check (data late ho toh bhi pakde)
             for sym in scan:
                 try:
                     check(api, sym, tokens[sym], tf, seen, trades)
@@ -419,7 +432,7 @@ def main():
                         api = login()
                     except Exception as e2:
                         print("Re-login failed:", e2)
-                time.sleep(0.5)
+                time.sleep(0.4)
 
     if traded_today:
         tg(summary(trades), as_html=True)
