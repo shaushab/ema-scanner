@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install smartapi-python pyotp requests logzero websocket-client
+      - run: pip install smartapi-python pyotp requests logzero websocket-client matplotlib
       - run: python scanner.py
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
