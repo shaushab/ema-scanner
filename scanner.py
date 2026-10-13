@@ -1,4 +1,4 @@
-import os, io, json, time, html, traceback, requests, pyotp
+import os, io, sys, json, time, html, traceback, requests, pyotp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -6,6 +6,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from SmartApi import SmartConnect
+
+sys.stdout.reconfigure(line_buffering=True)   # logs turant GitHub pe dikhen
 
 # ================= SETTINGS (sirf yahan badlav karein) =================
 FIXED       = ["LODHA"]      # ye shares hamesha scan honge
@@ -118,10 +120,20 @@ def get_tokens(symbols):
 
 def candles(api, token, tf):
     now = datetime.now(IST)
-    res = api.getCandleData({
-        "exchange": "NSE", "symboltoken": token, "interval": INTERVALS[tf],
-        "fromdate": (now - timedelta(days=HISTORY_DAYS[tf])).strftime("%Y-%m-%d %H:%M"),
-        "todate": now.strftime("%Y-%m-%d %H:%M")})
+    params = {"exchange": "NSE", "symboltoken": token, "interval": INTERVALS[tf],
+              "fromdate": (now - timedelta(days=HISTORY_DAYS[tf])).strftime("%Y-%m-%d %H:%M"),
+              "todate": now.strftime("%Y-%m-%d %H:%M")}
+    res = None
+    for attempt in range(2):
+        try:
+            res = api.getCandleData(params)
+            if res and res.get("status") is False:
+                raise RuntimeError(f"{res.get('errorcode')} {res.get('message')}")
+            break
+        except Exception:
+            if attempt == 1:
+                raise
+            time.sleep(2)
     rows = (res or {}).get("data") or []
     out = []
     for r in rows:
@@ -921,6 +933,7 @@ def main():
     tg(msg, as_html=True)
     last_refresh = datetime.now(IST)
     traded_today = False
+    err_count, last_err, last_err_alert = 0, "", 0.0
 
     while time.time() - start < MAX_RUN_MIN * 60:
         now = datetime.now(IST)
@@ -955,12 +968,25 @@ def main():
                 try:
                     check(api, sym, tokens[sym], tf, seen, trades)
                 except Exception as e:
-                    print("Error", sym, tf, e)
-                    try:
-                        api = login()
-                    except Exception as e2:
-                        print("Re-login failed:", e2)
-                time.sleep(0.4)
+                    err_count += 1
+                    last_err = f"{sym}: {e!r}"
+                    print("Error", last_err)
+                    low = str(e).lower()
+                    if any(k in low for k in ("token", "session", "unauthor", "ag8001", "ag8002", "ag8003")):
+                        try:
+                            api = login()
+                            print("Re-login OK")
+                        except Exception as e2:
+                            print("Re-login failed:", e2)
+                    else:
+                        time.sleep(2)                 # rate limit ho toh thoda ruko
+                    if err_count >= 15 and time.time() - last_err_alert > 1800:
+                        last_err_alert = time.time()
+                        tg(f"⚠️ Angel One se data lene me dikkat ({err_count} errors)\n"
+                           f"Last: {last_err[:200]}\nScanner chal raha hai, retry kar raha hai.")
+                else:
+                    err_count = 0
+                time.sleep(0.5)
 
     if traded_today:
         tg(summary(trades), as_html=True)
