@@ -81,6 +81,11 @@ def tg(text, as_html=False, reply_to=None, buttons=None):
             if not r.get("ok") and as_html:              # HTML galat ho toh plain text bhejo
                 data.pop("parse_mode", None)
                 r = requests.post(f"{TG_URL}/sendMessage", data=data, timeout=15).json()
+            if not r.get("ok") and "reply_markup" in data:   # buttons ki wajah se fail ho toh bina buttons
+                data.pop("reply_markup")
+                r = requests.post(f"{TG_URL}/sendMessage", data=data, timeout=15).json()
+            if not r.get("ok"):
+                print("Telegram failed:", r)
             mid = mid or (r.get("result") or {}).get("message_id")
         except Exception as e:
             print("Telegram error:", e)
@@ -97,6 +102,15 @@ def tg_photo(png, caption, buttons=None):
         if r.get("ok"):
             return r["result"]["message_id"]
         print("sendPhoto failed:", r)
+        if buttons:                                   # copy button support na ho toh unke bina bhejo
+            plain = [row for row in buttons if not any("copy_text" in b for b in row)]
+            data["reply_markup"] = json.dumps({"inline_keyboard": plain}) if plain else ""
+            if not plain:
+                data.pop("reply_markup")
+            r = requests.post(f"{TG_URL}/sendPhoto", data=data,
+                              files={"photo": ("chart.png", png, "image/png")}, timeout=30).json()
+            if r.get("ok"):
+                return r["result"]["message_id"]
     except Exception as e:
         print("Telegram photo error:", e)
     return tg(caption, as_html=True, buttons=buttons)     # photo fail ho toh text bhejo
@@ -228,6 +242,12 @@ def in_trade_time(t, tf):
 
 
 LAST_REV = {}
+
+
+def copy_row(sym, price, label="Entry"):
+    """Ek tap me copy hone wale buttons: share ka naam aur entry price alag-alag."""
+    return [{"text": f"📋 {sym}", "copy_text": {"text": sym}},
+            {"text": f"📋 {label} {price:.2f}", "copy_text": {"text": f"{price:.2f}"}}]
 
 
 def tv_link(sym):
@@ -461,7 +481,7 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
     else:
         head = "🔄🔴 <b>REVERSAL SELL</b> ⬇️"
         why = f"RSI overbought ({extreme:.0f}) se palta + red candle ne pichhla Low toda"
-    caption = (f"{head}\n<b>{hs}</b> • {tf}m • {t:%d-%b %H:%M}\n{why}\n{timing}\n\n"
+    caption = (f"{head}\n<b><code>{hs}</code></b> • {tf}m • {t:%d-%b %H:%M}\n{why}\n{timing}\n\n"
                f"💰 Entry:  <code>{cl:.2f}</code>\n"
                f"🛑 SL:     <code>{sl:.2f}</code>  (-{pct(sl):.2f}%)  swing {'low' if bull else 'high'}\n"
                f"🎯 T1:     <code>{t1:.2f}</code>  (+{pct(t1):.2f}%)  1:1\n"
@@ -470,7 +490,8 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
                "\n\n⚠️ <i>Reversal = trend ke ulta trade. Chhoti quantity rakho, SL zaroor lagao.</i>")
     share_txt = (f"🔄 {'BUY' if bull else 'SELL'} {sym} ({tf}m) reversal\n"
                  f"Entry {cl:.2f} | SL {sl:.2f} | T1 {t1:.2f} | T2 {tgt:.2f}")
-    buttons = [[{"text": "📤 Share Signal",
+    buttons = [copy_row(sym, cl),
+               [{"text": "📤 Share Signal",
                  "url": f"https://t.me/share/url?url={quote(tv_link(sym))}&text={quote(share_txt)}"},
                 {"text": "📈 Chart dekho", "url": tv_link(sym)}]]
     if BIG_EMOJI:
@@ -547,7 +568,7 @@ def send_signal(sym, tf, c, f, s, bull, trades, ltp, now):
         head = "🔴🔻 <b>SELL SIGNAL</b> ⬇️"
         line = f"EMA{FAST} ne EMA{SLOW} ko ⬇️ neeche cross kiya"
     caption = (f"{head}\n"
-               f"<b>{hs}</b> • {tf}m • {t:%d-%b %H:%M}\n"
+               f"<b><code>{hs}</code></b> • {tf}m • {t:%d-%b %H:%M}\n"
                f"{line}\n{timing}\n\n"
                f"💰 Entry:  <code>{cl:.2f}</code>\n"
                f"🛑 SL:     <code>{sl:.2f}</code>  (-{pct(sl):.2f}%)\n"
@@ -559,7 +580,8 @@ def send_signal(sym, tf, c, f, s, bull, trades, ltp, now):
     share_txt = (f"{'🟢 BUY' if bull else '🔴 SELL'} {sym} ({tf}m)\n"
                  f"Entry {cl:.2f} | SL {sl:.2f} | T1 {t1:.2f} | T2 {tgt:.2f}\n"
                  f"EMA {FAST}/{SLOW} crossover • {t:%d-%b %H:%M}")
-    buttons = [[{"text": "📤 Share Signal",
+    buttons = [copy_row(sym, cl),
+               [{"text": "📤 Share Signal",
                  "url": f"https://t.me/share/url?url={quote(tv_link(sym))}&text={quote(share_txt)}"},
                 {"text": "📈 Chart dekho", "url": tv_link(sym)}]]
 
@@ -819,7 +841,7 @@ def smc_new_plan(sym, tf, c, plan, now):
     pct = lambda a: abs(a - mid) / mid * 100
     stars = "⭐" * max(1, plan["stars"]) + "☆" * (4 - max(1, plan["stars"]))
     cap = (f"📋 <b>SMC PLAN — {plan['side']}</b> {'⬆️' if bull else '⬇️'}\n"
-           f"<b>{hs}</b> • {tf}m • {plan['t']:%d-%b %H:%M}\n\n"
+           f"<b><code>{hs}</code></b> • {tf}m • {plan['t']:%d-%b %H:%M}\n\n"
            f"💧 Liquidity sweep: {plan['liq_name']} {plan['liq']:.2f} "
            f"({'low' if bull else 'high'} {plan['sweep_px']:.2f}, vol {plan['sweep_vx']:.1f}x)\n"
            f"🔀 CHoCH: {plan['choch']:.2f} toda (vol {plan['choch_vx']:.1f}x)\n"
@@ -833,7 +855,8 @@ def smc_new_plan(sym, tf, c, plan, now):
            f"<i>SMC = price + volume se andaaza, guarantee nahi.</i>")
     share = (f"🧠 SMC {plan['side']} PLAN {sym} ({tf}m)\nZone {plan['zlo']:.2f}-{plan['zhi']:.2f} | "
              f"SL {plan['sl']:.2f} | T1 {plan['t1']:.2f} | T2 {plan['t2']:.2f}")
-    buttons = [[{"text": "📤 Share Plan",
+    buttons = [copy_row(sym, mid, "Zone"),
+               [{"text": "📤 Share Plan",
                  "url": f"https://t.me/share/url?url={quote(tv_link(sym))}&text={quote(share)}"},
                 {"text": "📈 Chart dekho", "url": tv_link(sym)}]]
     try:
@@ -873,7 +896,7 @@ def smc_track(sym, tf, c, trades, now):
                             if pvx < 1 else f"ℹ️ Pullback volume {pvx:.1f}x")
                 risk = abs(cl - p["sl"])
                 cap = (f"🎯🧠 <b>SMC ENTRY — {p['side']}</b> {'⬆️' if bull else '⬇️'}\n"
-                       f"<b>{hs}</b> • {tf}m • {t:%d-%b %H:%M}\n"
+                       f"<b><code>{hs}</code></b> • {tf}m • {t:%d-%b %H:%M}\n"
                        f"Price {p['ztype']} zone me aaya + {'green' if bull else 'red'} candle\n\n"
                        f"💰 Entry:  <code>{cl:.2f}</code>\n"
                        f"🛑 SL:     <code>{p['sl']:.2f}</code>  (risk {risk:.2f}/share)\n"
@@ -881,10 +904,10 @@ def smc_track(sym, tf, c, trades, now):
                        f"🎯 T2:     <code>{p['t2']:.2f}</code>  ({p['t2n']})\n\n{vol_note}")
                 try:
                     msg_id = tg_photo(make_smc_chart(sym, tf, c[:i + 1], p, entry=cl), cap,
-                                      [[{"text": "📈 Chart dekho", "url": tv_link(sym)}]])
+                                      [copy_row(sym, cl), [{"text": "📈 Chart dekho", "url": tv_link(sym)}]])
                 except Exception as e:
                     print("SMC chart error:", e)
-                    msg_id = tg(cap, as_html=True, reply_to=p["mid"])
+                    msg_id = tg(cap, as_html=True, reply_to=p["mid"], buttons=[copy_row(sym, cl)])
                 trades.append({"sym": sym, "tf": tf, "side": p["side"], "entry": cl, "sl": p["sl"],
                                "t1": p["t1"], "tgt": p["t2"], "t": t, "last": t, "t1hit": False,
                                "mid": msg_id, "status": "OPEN", "kind": "SMC"})
@@ -900,8 +923,8 @@ def build_watch(api, tokens, title):
     watch = [s for s in FIXED if s in tokens] + [x[0] for x in g] + [x[0] for x in l]
     watch = list(dict.fromkeys(watch))
     msg = f"{title}\n📌 <b>Fixed:</b> {html.escape(', '.join(FIXED))}\n\n📈 <b>Top Gainers</b>\n"
-    msg += "\n".join(f"🟢 {html.escape(s)}  <code>{p:+.2f}%</code>" for s, p in g)
-    msg += "\n\n📉 <b>Top Losers</b>\n" + "\n".join(f"🔴 {html.escape(s)}  <code>{p:+.2f}%</code>" for s, p in l)
+    msg += "\n".join(f"🟢 <code>{html.escape(s)}</code>  {p:+.2f}%" for s, p in g)
+    msg += "\n\n📉 <b>Top Losers</b>\n" + "\n".join(f"🔴 <code>{html.escape(s)}</code>  {p:+.2f}%" for s, p in l)
     return watch, msg
 
 
