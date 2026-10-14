@@ -2,6 +2,8 @@ import os, io, sys, json, time, html, traceback, requests, pyotp
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -22,11 +24,19 @@ BIG_EMOJI   = True           # alert se pehle bada 🚀 / 🔻 emoji
 MAX_LATE    = 20             # data late aaye toh bhi itne minute tak ka crossover pakdo
 STRATEGY_EMA      = True     # EMA 9/21 crossover signals
 STRATEGY_REVERSAL = True     # Reversal (bottom/top) signals
-RSI_LOW, RSI_HIGH = 30, 70   # oversold / overbought
+RSI_LOW, RSI_HIGH = 40, 60   # reversal ke liye RSI kitna neeche/upar gaya ho (30/70 = kam par strong signal)
+REV_WITH_TREND = True        # True = sirf trend (EMA200) ki direction me reversal entry
+WHIPSAW_MIN = 30             # usi share pe itne min me ulta EMA crossover hua ho toh naya EMA signal skip
+SL_COOLDOWN_MIN = 45         # kisi share pe SL lage toh itne min tak us share pe naya signal nahi
+MAX_SIGNALS_PER_STOCK = 3    # ek share pe din me zyada se zyada itne naye signals
+NEWS_ON        = True        # watchlist shares ki news Telegram pe
+NEWS_EVERY_MIN = 20          # har kitne minute me news check ho
+MOOD_ON        = True        # market mood + sectoral movement
+MOOD_TIMES     = ["09:21", "11:30", "13:30"]   # IST me kab-kab market mood bheje
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
 MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
-STRATEGY_SMC      = True     # Smart Money Concepts (sweep + CHoCH + FVG/OB) signals
+STRATEGY_SMC      = False    # Smart Money Concepts (sweep + CHoCH + FVG/OB) signals
 SMC_FROM, SMC_TILL = "09:30", "14:45"       # SMC plans sirf is time me
 SMC_SWEEP_LOOKBACK = 15      # CHoCH se pehle kitni candles me liquidity sweep dhundhe
 SMC_EXPIRY = 6               # plan ke baad kitni candles tak entry zone ka intezaar
@@ -125,8 +135,12 @@ def login():
     return api
 
 
+SCRIP_DATA = None
+
+
 def get_tokens(symbols):
-    data = requests.get(SCRIP_URL, timeout=90).json()
+    global SCRIP_DATA
+    data = SCRIP_DATA = requests.get(SCRIP_URL, timeout=90).json()
     want = {f"{s.upper()}-EQ": s.upper() for s in symbols}
     return {want[r["symbol"]]: r["token"] for r in data
             if r.get("exch_seg") == "NSE" and r.get("symbol") in want}
@@ -155,6 +169,9 @@ def candles(api, token, tf):
         if t + timedelta(minutes=tf) <= now:      # sirf poori bani candles
             out.append((t, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
     return out
+
+
+LAST_PCT = {}
 
 
 def movers(api, tokens):
@@ -186,6 +203,8 @@ def movers(api, tokens):
             except Exception as e:
                 print("Daily candle error", sym, e)
             time.sleep(0.4)
+    LAST_PCT.clear()
+    LAST_PCT.update(pct)
     ranked = sorted(pct.items(), key=lambda x: x[1], reverse=True)
     return ranked[:TOP_N], list(reversed(ranked[-TOP_N:]))
 
@@ -242,6 +261,22 @@ def in_trade_time(t, tf):
 
 
 LAST_REV = {}
+RUN_START = None             # is run ke shuru hone ka time (purani candles pe dobara alert nahi)
+LAST_CROSS = {}              # (sym, tf) -> (candle time, "BUY"/"SELL")
+SL_TIME = {}                 # sym -> SL lagne ka time
+SIG_COUNT = {}               # sym -> aaj kitne signals gaye
+
+
+def gate(sym, t):
+    """Cooldown aur per-stock limit check. True = signal bhej sakte hain."""
+    last_sl = SL_TIME.get(sym)
+    if last_sl is not None and timedelta(0) <= t - last_sl < timedelta(minutes=SL_COOLDOWN_MIN):
+        return False
+    return SIG_COUNT.get(sym, 0) < MAX_SIGNALS_PER_STOCK
+
+
+def count_sig(sym):
+    SIG_COUNT[sym] = SIG_COUNT.get(sym, 0) + 1
 
 
 def copy_row(sym, price, label="Entry"):
@@ -250,8 +285,10 @@ def copy_row(sym, price, label="Entry"):
             {"text": f"📋 {label} {price:.2f}", "copy_text": {"text": f"{price:.2f}"}}]
 
 
-def tv_link(sym):
-    return f"https://www.tradingview.com/chart/?symbol=NSE:{sym.replace('&', '_').replace('-', '_')}"
+def tv_link(sym, tf=None):
+    tf = tf or TIMEFRAMES[0]
+    return (f"https://www.tradingview.com/chart/?symbol=NSE:{sym.replace('&', '_').replace('-', '_')}"
+            f"&interval={tf}")
 
 
 # ----------------------------- CHART -----------------------------
@@ -331,6 +368,7 @@ def check(api, sym, token, tf, seen, trades):
                        as_html=True, reply_to=tr["mid"])
                 else:
                     tr["status"] = "SL"
+                    SL_TIME[sym] = t
                     tg(f"🛑 <b>STOP LOSS HIT</b> {hs} {tf}m\nEntry {tr['entry']:.2f} → SL {tr['sl']:.2f}\n"
                        f"❌ Loss: {abs(tr['entry'] - tr['sl']):.2f} / share", as_html=True, reply_to=tr["mid"])
                 break
@@ -364,6 +402,8 @@ def check(api, sym, token, tf, seen, trades):
             continue
         if now - (t + timedelta(minutes=tf)) > timedelta(minutes=MAX_LATE):
             continue
+        if RUN_START is not None and t + timedelta(minutes=tf) < RUN_START - timedelta(minutes=2):
+            continue                                   # run shuru hone se pehle ki candle (duplicate se bachao)
 
         # --- 0) SMC PLAN (sweep + CHoCH + FVG/OB) ---
         if STRATEGY_SMC and hm_ok(t, tf, SMC_FROM, SMC_TILL) and (sym, tf, t, "SMC") not in seen:
@@ -373,7 +413,8 @@ def check(api, sym, token, tf, seen, trades):
                 busy = any(p["sym"] == sym and p["tf"] == tf and p["status"] == "WAIT" for p in SMC_PLANS) or \
                     any(tr["sym"] == sym and tr["tf"] == tf and tr["status"] == "OPEN" and tr.get("kind") == "SMC"
                         for tr in trades)
-                if not busy:
+                if not busy and gate(sym, t):
+                    count_sig(sym)
                     smc_new_plan(sym, tf, c[:idx + 1], plan, now)
                     seen.add((sym, tf, t, "REV"))          # same candle pe duplicate reversal nahi
 
@@ -388,7 +429,8 @@ def check(api, sym, token, tf, seen, trades):
                                for p in SMC_PLANS) or \
                     any(tr["sym"] == sym and tr["tf"] == tf and tr["status"] == "OPEN" and tr["side"] == rev
                         and tr.get("kind") == "SMC" for tr in trades)
-                if not cool and not smc_busy:
+                if not cool and not smc_busy and gate(sym, t):
+                    count_sig(sym)
                     LAST_REV[(sym, tf, rev)] = t
                     send_reversal(sym, tf, c[:idx + 1], f[:idx + 1], s[:idx + 1], rs[:idx + 1],
                                   rev == "BUY", trades, c[-1][4], now)
@@ -401,26 +443,49 @@ def check(api, sym, token, tf, seen, trades):
             if (bull or bear) and key not in seen:
                 seen.add(key)
                 side = "BUY" if bull else "SELL"
+                prev_x = LAST_CROSS.get((sym, tf))
+                LAST_CROSS[(sym, tf)] = (t, side)
+                whipsaw = prev_x is not None and prev_x[1] != side and \
+                    t - prev_x[0] < timedelta(minutes=WHIPSAW_MIN)
                 rev_open = [tr for tr in trades if tr["sym"] == sym and tr["tf"] == tf
                             and tr["status"] == "OPEN" and tr.get("kind") in ("REV", "SMC") and tr["side"] == side]
                 if rev_open:                       # reversal trade ko confirm karo, naya trade nahi
                     tg(f"✅ <b>CONFIRM</b> {hs} {tf}m\nEMA{FAST}/{SLOW} crossover ne {side} trade ko confirm kiya "
                        f"@ {c[idx][4]:.2f}\n💡 Trade hold karo (ya add karo)", as_html=True, reply_to=rev_open[0]["mid"])
-                else:
+                elif not whipsaw and gate(sym, t):
+                    count_sig(sym)
                     send_signal(sym, tf, c[:idx + 1], f[:idx + 1], s[:idx + 1], bull, trades, c[-1][4], now)
+                else:
+                    print(f"Skip EMA {side} {sym} {t:%H:%M}: " + ("whipsaw" if whipsaw else "cooldown/limit"))
 
 
 def reversal_at(c, f, rs, idx):
-    """Reversal candle: pehle RSI oversold/overbought, phir strong ulti candle."""
+    """Jaldi reversal: fresh swing low/high pe ulti candle (engulf / break / hammer) + RSI mud raha ho.
+    Bottom/top ke 1 candle ke andar signal deta hai — EMA crossover ka intezaar nahi."""
     t, o, h, l, cl, v = c[idx]
     prev = c[idx - 1]
-    window = range(idx - REV_LOOKBACK, idx + 1)
-    oversold = min(rs[j] for j in window) < RSI_LOW
-    overbought = max(rs[j] for j in window) > RSI_HIGH
-    if oversold and cl > o and cl > prev[2] and rs[idx] > rs[idx - 1] and cl > f[idx]:
-        return "BUY"      # green candle ne pichhla High toda + EMA9 ke upar close
-    if overbought and cl < o and cl < prev[3] and rs[idx] < rs[idx - 1] and cl < f[idx]:
-        return "SELL"     # red candle ne pichhla Low toda + EMA9 ke neeche close
+    win = c[idx - REV_LOOKBACK: idx + 1]
+    rng = (h - l) or 1e-9
+    body_lo, body_hi = min(o, cl), max(o, cl)
+    rwin = rs[idx - REV_LOOKBACK: idx + 1]
+    closes = [x[4] for x in c[:idx + 1]]
+    e200 = ema(closes, 200)[-1] if len(closes) >= 200 else None
+
+    # --- BUY: abhi-abhi naya low bana aur ulti green candle ---
+    fresh_low = min(l, prev[3]) <= min(x[3] for x in win) + 1e-9
+    engulf_up = cl > o and cl > prev[2]                                   # pichhli candle ka High toda
+    hammer = cl > o and (body_lo - l) >= 0.5 * rng and cl > prev[4]       # lambi neeche wick (rejection)
+    if fresh_low and (engulf_up or hammer) and min(rwin) < RSI_LOW and rs[idx] > rs[idx - 1]:
+        if not REV_WITH_TREND or e200 is None or cl > e200:
+            return "BUY"
+
+    # --- SELL: abhi-abhi naya high bana aur ulti red candle ---
+    fresh_high = max(h, prev[2]) >= max(x[2] for x in win) - 1e-9
+    engulf_dn = cl < o and cl < prev[3]
+    star = cl < o and (h - body_hi) >= 0.5 * rng and cl < prev[4]          # lambi upar wick (rejection)
+    if fresh_high and (engulf_dn or star) and max(rwin) > RSI_HIGH and rs[idx] < rs[idx - 1]:
+        if not REV_WITH_TREND or e200 is None or cl < e200:
+            return "SELL"
     return None
 
 
@@ -455,7 +520,7 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
     if vol_x >= 1.5:
         stars += 1
         notes.append(f"✅ Volume {vol_x:.1f}x zyada")
-    if (bull and extreme < 25) or (not bull and extreme > 75):
+    if (bull and extreme < 30) or (not bull and extreme > 70):
         stars += 1
         notes.append(f"✅ RSI bahut extreme tha ({extreme:.0f})")
     else:
@@ -477,10 +542,10 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
     pct = lambda a: abs(a - cl) / cl * 100
     if bull:
         head = "🔄🟢 <b>REVERSAL BUY</b> ⬆️"
-        why = f"RSI oversold ({extreme:.0f}) se palta + green candle ne pichhla High toda"
+        why = f"Naya low bana, phir green rejection candle (RSI {extreme:.0f} se palta)"
     else:
         head = "🔄🔴 <b>REVERSAL SELL</b> ⬇️"
-        why = f"RSI overbought ({extreme:.0f}) se palta + red candle ne pichhla Low toda"
+        why = f"Naya high bana, phir red rejection candle (RSI {extreme:.0f} se palta)"
     caption = (f"{head}\n<b><code>{hs}</code></b> • {tf}m • {t:%d-%b %H:%M}\n{why}\n{timing}\n\n"
                f"💰 Entry:  <code>{cl:.2f}</code>\n"
                f"🛑 SL:     <code>{sl:.2f}</code>  (-{pct(sl):.2f}%)  swing {'low' if bull else 'high'}\n"
@@ -918,6 +983,190 @@ def smc_track(sym, tf, c, trades, now):
                 break
 
 
+# ----------------------------- NEWS + MARKET MOOD -----------------------------
+NEWS_NAME = {"LODHA": "Lodha Developers", "BEL": "Bharat Electronics", "M&M": "Mahindra",
+             "TMPV": "Tata Motors", "LT": "Larsen Toubro", "ETERNAL": "Eternal Zomato",
+             "BAJAJ-AUTO": "Bajaj Auto", "BAJFINANCE": "Bajaj Finance", "BAJAJFINSV": "Bajaj Finserv",
+             "HDFCBANK": "HDFC Bank", "HDFCLIFE": "HDFC Life", "ICICIBANK": "ICICI Bank", "SBIN": "SBI",
+             "SBILIFE": "SBI Life", "KOTAKBANK": "Kotak Mahindra Bank", "AXISBANK": "Axis Bank",
+             "INFY": "Infosys", "TCS": "TCS", "HCLTECH": "HCLTech", "TECHM": "Tech Mahindra",
+             "WIPRO": "Wipro", "RELIANCE": "Reliance Industries", "BHARTIARTL": "Bharti Airtel",
+             "ITC": "ITC", "HINDUNILVR": "Hindustan Unilever", "ASIANPAINT": "Asian Paints",
+             "MARUTI": "Maruti Suzuki", "SUNPHARMA": "Sun Pharma", "DRREDDY": "Dr Reddy's",
+             "CIPLA": "Cipla", "APOLLOHOSP": "Apollo Hospitals", "MAXHEALTH": "Max Healthcare",
+             "NTPC": "NTPC", "POWERGRID": "Power Grid", "ONGC": "ONGC", "COALINDIA": "Coal India",
+             "TATASTEEL": "Tata Steel", "JSWSTEEL": "JSW Steel", "HINDALCO": "Hindalco",
+             "ULTRACEMCO": "UltraTech Cement", "GRASIM": "Grasim", "TITAN": "Titan", "TRENT": "Trent",
+             "NESTLEIND": "Nestle India", "TATACONSUM": "Tata Consumer", "EICHERMOT": "Eicher Motors",
+             "ADANIENT": "Adani Enterprises", "ADANIPORTS": "Adani Ports", "SHRIRAMFIN": "Shriram Finance",
+             "JIOFIN": "Jio Financial", "INDIGO": "IndiGo InterGlobe", "BSE": "BSE Ltd"}
+POS_WORDS = ["surge", "soar", "jump", "rally", "gains", "rises", "climb", "upgrade", "outperform",
+             "beats", "record high", "order win", "bags order", "wins order", "profit rises", "profit jumps",
+             "strong", "bullish", "top gainer", "buy rating", "expands", "approval"]
+NEG_WORDS = ["fall", "falls", "slump", "plunge", "drops", "decline", "downgrade", "underperform",
+             "misses", "loss", "weak", "probe", "penalty", "raid", "bearish", "crash", "top loser",
+             "sell rating", "slips", "tumble", "concern", "fraud", "resign"]
+NEWS_SEEN = set()
+LAST_NEWS_SCAN = None
+MOOD_SENT = set()
+IDX_TOKENS = {}
+IDX_WANT = {"NIFTY 50": ["nifty 50", "nifty"], "BANK NIFTY": ["nifty bank", "banknifty"],
+            "IT": ["nifty it"], "AUTO": ["nifty auto"], "PHARMA": ["nifty pharma"], "FMCG": ["nifty fmcg"],
+            "METAL": ["nifty metal"], "REALTY": ["nifty realty"], "ENERGY": ["nifty energy"],
+            "PSU BANK": ["nifty psu bank"], "FIN SERVICE": ["nifty fin service", "nifty financial services"],
+            "MEDIA": ["nifty media"], "PVT BANK": ["nifty pvt bank", "nifty private bank"]}
+
+
+def google_news(query, max_items=8):
+    url = "https://news.google.com/rss/search?q=" + quote(query) + "&hl=en-IN&gl=IN&ceid=IN:en"
+    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+    root = ET.fromstring(r.content)
+    out = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        try:
+            dt = parsedate_to_datetime(it.findtext("pubDate")).astimezone(IST)
+        except Exception:
+            continue
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3]
+        out.append((dt, title, link, src))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out[:max_items]
+
+
+def news_tone(title):
+    t = title.lower()
+    pos = sum(w in t for w in POS_WORDS)
+    neg = sum(w in t for w in NEG_WORDS)
+    return "🟢" if pos > neg else "🔴" if neg > pos else "⚪"
+
+
+def scan_news(symbols, now):
+    """Watchlist shares ki nayi news Telegram pe bhejo."""
+    global LAST_NEWS_SCAN
+    first = LAST_NEWS_SCAN is None
+    if first:
+        cutoff = now - timedelta(hours=6) if now.hour < 12 else RUN_START - timedelta(minutes=20)
+        per_stock = 1
+    else:
+        cutoff = LAST_NEWS_SCAN - timedelta(minutes=10)
+        per_stock = 2
+    LAST_NEWS_SCAN = now
+    for sym in symbols:
+        name = NEWS_NAME.get(sym, sym)
+        key_word = name.split()[0].lower().replace("'s", "")
+        try:
+            items = google_news(f'"{name}" share')
+        except Exception as e:
+            print("News error", sym, e)
+            continue
+        fresh = []
+        for dt, title, link, src in items:
+            if dt < cutoff or link in NEWS_SEEN or key_word not in title.lower():
+                continue
+            NEWS_SEEN.add(link)
+            fresh.append((dt, title, link, src))
+        for dt, title, link, src in fresh[:per_stock]:
+            hs = html.escape(sym)
+            msg = (f"📰 <b><code>{hs}</code></b> news {news_tone(title)}\n"
+                   f"{html.escape(title)}\n"
+                   f"🕐 {dt:%d-%b %H:%M}" + (f" • {html.escape(src)}" if src else ""))
+            tg(msg, as_html=True, buttons=[[{"text": "📖 Poori news padho", "url": link},
+                                           {"text": f"📋 {sym}", "copy_text": {"text": sym}}]])
+        time.sleep(1)
+
+
+def premarket_news(now):
+    """Subah market ke bade headlines."""
+    try:
+        items = google_news("Sensex Nifty today stock market", 10)
+    except Exception as e:
+        print("Premarket news error", e)
+        return
+    items = [x for x in items if x[0] > now - timedelta(hours=14)][:4]
+    if not items:
+        return
+    lines = ["🌅 <b>Aaj ke market headlines</b>"]
+    for dt, title, link, src in items:
+        NEWS_SEEN.add(link)
+        lines.append(f"{news_tone(title)} <a href=\"{html.escape(link)}\">{html.escape(title)}</a> "
+                     f"<i>({dt:%H:%M}{' • ' + html.escape(src) if src else ''})</i>")
+    tg("\n\n".join(lines), as_html=True)
+
+
+def find_index_tokens():
+    if not SCRIP_DATA:
+        return {}
+    found = {}
+    for r in SCRIP_DATA:
+        if r.get("exch_seg") != "NSE" or r.get("instrumenttype") != "AMXIDX":
+            continue
+        names = {str(r.get("symbol", "")).lower().strip(), str(r.get("name", "")).lower().strip()}
+        for label, alts in IDX_WANT.items():
+            if label not in found and names & set(alts):
+                found[label] = str(r["token"])
+    return found
+
+
+def market_mood(api, now):
+    global IDX_TOKENS
+    if not IDX_TOKENS:
+        IDX_TOKENS = find_index_tokens()
+    vals = {}
+    if IDX_TOKENS:
+        res = api.getMarketData("FULL", {"NSE": list(IDX_TOKENS.values())})
+        inv = {v: k for k, v in IDX_TOKENS.items()}
+        for d in ((res or {}).get("data") or {}).get("fetched") or []:
+            lab = inv.get(str(d.get("symbolToken")))
+            if lab and d.get("percentChange") is not None:
+                vals[lab] = (float(d.get("ltp") or 0), float(d["percentChange"]),
+                             float(d.get("open") or 0), float(d.get("close") or 0))
+    pct = dict(LAST_PCT)
+    adv = sum(1 for v in pct.values() if v > 0)
+    dec = sum(1 for v in pct.values() if v < 0)
+    lines = [f"🧭 <b>MARKET MOOD</b> — {now:%H:%M} IST"]
+    nifty = vals.get("NIFTY 50")
+    if nifty:
+        ltp, pc, op, pcl = nifty
+        gap = (op - pcl) / pcl * 100 if pcl else 0
+        gap_txt = "Gap-up" if gap > 0.2 else "Gap-down" if gap < -0.2 else "Flat open"
+        lines.append(f"{'🟢' if pc >= 0 else '🔴'} NIFTY 50: <b>{ltp:,.2f}</b> ({pc:+.2f}%) • {gap_txt} {gap:+.2f}%")
+    if vals.get("BANK NIFTY"):
+        ltp, pc, _, _ = vals["BANK NIFTY"]
+        lines.append(f"{'🟢' if pc >= 0 else '🔴'} BANK NIFTY: <b>{ltp:,.2f}</b> ({pc:+.2f}%)")
+    if pct:
+        lines.append(f"📊 Nifty 50 breadth: {adv} 🟢 / {dec} 🔴")
+    sectors = sorted(((k, v[1]) for k, v in vals.items() if k not in ("NIFTY 50", "BANK NIFTY")),
+                     key=lambda x: x[1], reverse=True)
+    if sectors:
+        lines.append("\n🏭 <b>Sectoral movement</b>")
+        for k, v in sectors:
+            bar = "🟩" * min(5, int(abs(v) / 0.4) + 1) if v >= 0 else "🟥" * min(5, int(abs(v) / 0.4) + 1)
+            lines.append(f"{'🟢' if v >= 0 else '🔴'} {k:<11} {v:+.2f}% {bar}")
+        strong = ", ".join(k for k, v in sectors[:2] if v > 0)
+        weak = ", ".join(k for k, v in sectors[-2:][::-1] if v < 0)
+        if strong:
+            lines.append(f"\n💪 Strong: {strong}")
+        if weak:
+            lines.append(f"🥵 Weak: {weak}")
+    # bias
+    npc = nifty[1] if nifty else (sum(pct.values()) / len(pct) if pct else 0)
+    breadth = adv / max(1, adv + dec)
+    if npc > 0.3 and breadth >= 0.6:
+        bias = "🟢 <b>BULLISH</b> — BUY setups pe zyada focus, SELL se bacho"
+    elif npc < -0.3 and breadth <= 0.4:
+        bias = "🔴 <b>BEARISH</b> — SELL setups pe zyada focus, BUY se bacho"
+    else:
+        bias = "🟡 <b>SIDEWAYS / MIXED</b> — chhota target, jaldi profit book, kam trades"
+    lines.append(f"\n🧭 Bias: {bias}")
+    lines.append("<i>Yeh prediction nahi, abhi tak ke data ka mood hai.</i>")
+    if len(lines) > 3:
+        tg("\n".join(lines), as_html=True)
+
+
 def build_watch(api, tokens, title):
     g, l = movers(api, tokens)
     watch = [s for s in FIXED if s in tokens] + [x[0] for x in g] + [x[0] for x in l]
@@ -945,15 +1194,19 @@ def summary(trades):
 
 # ----------------------------- MAIN -----------------------------
 def main():
+    global RUN_START
     start = time.time()
+    RUN_START = datetime.now(IST)
     tokens = get_tokens(FIXED + UNIVERSE)
     missing = [s for s in FIXED + UNIVERSE if s.upper() not in tokens]
     api = login()
     seen, trades = set(), []
-    watch, msg = build_watch(api, tokens, "✅ <b>Scanner chalu ho gaya</b> (SMC + Reversal + EMA)")
+    watch, msg = build_watch(api, tokens, "✅ <b>Scanner chalu ho gaya</b> (Reversal + EMA)")
     if missing:
         msg += "\n\n⚠️ Ye symbol nahi mile: " + ", ".join(missing)
     tg(msg, as_html=True)
+    if NEWS_ON and RUN_START.hour < 10:
+        premarket_news(RUN_START)
     last_refresh = datetime.now(IST)
     traded_today = False
     err_count, last_err, last_err_alert = 0, "", 0.0
@@ -982,6 +1235,22 @@ def main():
             except Exception as e:
                 print("Movers update error:", e)
             last_refresh = now
+
+        if MOOD_ON:
+            for mt in MOOD_TIMES:
+                hh, mm = map(int, mt.split(":"))
+                mt_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if mt not in MOOD_SENT and mt_dt <= now < mt_dt + timedelta(minutes=10):
+                    MOOD_SENT.add(mt)
+                    try:
+                        market_mood(api, now)
+                    except Exception as e:
+                        print("Mood error:", e)
+        if NEWS_ON and (LAST_NEWS_SCAN is None or now - LAST_NEWS_SCAN >= timedelta(minutes=NEWS_EVERY_MIN)):
+            try:
+                scan_news(watch, now)
+            except Exception as e:
+                print("News scan error:", e)
 
         open_syms = [t["sym"] for t in trades if t["status"] == "OPEN"] + \
             [p["sym"] for p in SMC_PLANS if p["status"] == "WAIT"]
