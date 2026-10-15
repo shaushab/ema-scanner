@@ -43,6 +43,9 @@ HIST_REFRESH_MIN = 10        # Angel ki candle history har kitne min me dobara l
 COMMANDS_ON    = True        # Telegram pe /FMCG, /IT, /BANK ... likhne pe us sector ke F&O shares ki list
 PREDICT_ON     = True        # subah 9:05 IST pe NIFTY opening prediction (US + VIX + Breadth) + backtest
 GAP_PCT        = 0.20        # isse zyada = Gap Up, isse kam (minus) = Gap Down, beech me = Flat
+REPORT_AT      = "15:20"     # IST — din ka poora report
+PART1_STOP     = "14:40"     # IST — part 1 yahan rukta hai, part 2 market close tak (GitHub 6 ghante limit)
+RUN_PART       = os.environ.get("RUN_PART", "")   # workflow se "1" ya "2"
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
 MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
@@ -474,6 +477,7 @@ def check(api, sym, token, tf, seen, trades):
         if tr["sym"] != sym or tr["tf"] != tf or tr["status"] != "OPEN":
             continue
         buy = tr["side"] == "BUY"
+        tr.setdefault("risk", abs(tr["entry"] - tr["sl"]) or 1e-9)
         for t, o, h, l, cl, v in c:
             if t <= tr["last"]:
                 continue
@@ -507,6 +511,7 @@ def check(api, sym, token, tf, seen, trades):
             opp = (buy and f[-1] < s[-1]) or (not buy and f[-1] > s[-1])
             if opp:
                 tr["status"] = "EXIT"
+                tr["exit_px"] = closes[-1]
                 pnl = (closes[-1] - tr["entry"]) * (1 if buy else -1)
                 tg(f"⚠️ <b>EXIT SIGNAL</b> {hs} {tf}m\nUlta crossover ho gaya\n"
                    f"Entry {tr['entry']:.2f} → Abhi {closes[-1]:.2f}  ({pnl:+.2f} / share)",
@@ -1669,6 +1674,7 @@ def opening_prediction(api, tokens):
         return
     prevD, sig = fr
     sc, pred, bias = score_pred(sig)
+    PRED_TODAY.update({"date": now.date().isoformat(), "pred": pred, "bias": bias, "score": sc})
     b = stats.get(sc)
     if b and b[0] >= 8:
         conf = b[1] / b[0] * 100
@@ -1727,6 +1733,222 @@ def opening_prediction(api, tokens):
     tg("\n".join(lines), as_html=True)
 
 
+# ----------------------------- STATE (part 1 -> part 2) + DAILY REPORT -----------------------------
+STATE_FILE = "state.json"
+PRED_TODAY = {}
+REPORT_SENT = False
+
+
+def _enc(x):
+    if hasattr(x, "isoformat") and hasattr(x, "hour"):
+        return {"__dt": x.isoformat()}
+    if isinstance(x, dict):
+        return {str(k): _enc(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_enc(v) for v in x]
+    return x
+
+
+def _dec(x):
+    if isinstance(x, dict):
+        if "__dt" in x:
+            return datetime.fromisoformat(x["__dt"])
+        return {k: _dec(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_dec(v) for v in x]
+    return x
+
+
+def save_state(seen, trades):
+    try:
+        st = {"date": datetime.now(IST).date().isoformat(), "trades": _enc(trades),
+              "seen": [_enc(list(k)) for k in seen], "sig_count": SIG_COUNT,
+              "sl_time": _enc(SL_TIME),
+              "last_cross": [[k[0], k[1], _enc(v[0]), v[1]] for k, v in LAST_CROSS.items()],
+              "last_rev": [[k[0], k[1], k[2], _enc(v)] for k, v in LAST_REV.items()],
+              "pred": PRED_TODAY, "mood_sent": list(MOOD_SENT), "news_seen": list(NEWS_SEEN)[-500:],
+              "report_sent": REPORT_SENT}
+        with open(STATE_FILE, "w") as fh:
+            json.dump(st, fh)
+    except Exception as e:
+        print("State save error:", e)
+
+
+def load_state(seen, trades):
+    global REPORT_SENT
+    try:
+        with open(STATE_FILE) as fh:
+            st = json.load(fh)
+    except Exception:
+        return False
+    if st.get("date") != datetime.now(IST).date().isoformat():
+        return False
+    trades.extend(_dec(st.get("trades") or []))
+    for k in st.get("seen") or []:
+        seen.add(tuple(_dec(k)))
+    SIG_COUNT.update(st.get("sig_count") or {})
+    SL_TIME.update(_dec(st.get("sl_time") or {}))
+    for a, b, t, side in st.get("last_cross") or []:
+        LAST_CROSS[(a, b)] = (_dec(t), side)
+    for a, b, c_, t in st.get("last_rev") or []:
+        LAST_REV[(a, b, c_)] = _dec(t)
+    PRED_TODAY.update(st.get("pred") or {})
+    MOOD_SENT.update(st.get("mood_sent") or [])
+    NEWS_SEEN.update(st.get("news_seen") or [])
+    REPORT_SENT = bool(st.get("report_sent"))
+    print(f"State load: {len(trades)} trades")
+    return True
+
+
+def quote_full(api, toks):
+    out = {}
+    toks = list(dict.fromkeys(str(t) for t in toks if t))
+    for i in range(0, len(toks), 50):
+        res = api.getMarketData("FULL", {"NSE": toks[i:i + 50]})
+        for d in ((res or {}).get("data") or {}).get("fetched") or []:
+            out[str(d.get("symbolToken"))] = d
+    return out
+
+
+def trade_r(tr, ltp=None):
+    risk = tr.get("risk") or abs(tr["t1"] - tr["entry"]) or 1e-9
+    sgn = 1 if tr["side"] == "BUY" else -1
+    st = tr["status"]
+    if st == "TARGET":
+        return 1.5                       # aadha T1 (+0.5R) + aadha T2 (+1R)
+    if st == "BE":
+        return 0.5
+    if st == "SL":
+        return -1.0
+    px = tr.get("exit_px") if st == "EXIT" else ltp
+    if px is None:
+        return 0.5 if tr.get("t1hit") else 0.0
+    mv = (px - tr["entry"]) * sgn / risk
+    return 0.5 + 0.5 * mv if tr.get("t1hit") else mv
+
+
+def daily_report(api, trades, tokens):
+    now = datetime.now(IST)
+    lines = [f"📋 <b>AAJ KA POORA REPORT</b> — {now:%d-%b-%Y} ({now:%H:%M} IST)", ""]
+    # --- market ---
+    nifty_tok = index_token(["nifty 50", "nifty"], "99926000")
+    vix_tok = index_token(["india vix", "indiavix"])
+    q = {}
+    try:
+        q = quote_full(api, [nifty_tok, vix_tok])
+    except Exception as e:
+        print("Report quote error:", e)
+    n = q.get(str(nifty_tok))
+    day_pc = None
+    pos = None
+    if n:
+        ltp, op, hi, lo, pc = (float(n.get(k) or 0) for k in ("ltp", "open", "high", "low", "close"))
+        gap = (op / pc - 1) * 100 if pc else 0
+        act = outcome(gap)
+        day_pc = (ltp / pc - 1) * 100 if pc else 0
+        pos = (ltp - lo) / (hi - lo) if hi > lo else 0.5
+        lines.append(f"🔔 <b>Opening</b>: kal close {pc:,.2f} → open {op:,.2f} ({gap:+.2f}%) = <b>{act}</b>")
+        if PRED_TODAY.get("pred"):
+            ok = PRED_TODAY["pred"] == act
+            lines.append(f"🔮 Subah ka prediction: {PRED_TODAY['pred']} (score {PRED_TODAY.get('score', 0):+d}) "
+                         f"{'✅ sahi' if ok else '❌ galat'}")
+        lines.append(f"{'🟢' if day_pc >= 0 else '🔴'} Nifty abhi {ltp:,.2f} ({day_pc:+.2f}%) • "
+                     f"range {lo:,.0f}–{hi:,.0f}")
+    v = q.get(str(vix_tok)) if vix_tok else None
+    vix_pc = None
+    if v:
+        vix_pc = float(v.get("percentChange") or 0)
+        lines.append(f"😰 India VIX {float(v.get('ltp') or 0):.2f} ({vix_pc:+.2f}%)")
+    adv = dec = 0
+    try:
+        movers(api, tokens)
+        adv = sum(1 for x in LAST_PCT.values() if x > 0)
+        dec = sum(1 for x in LAST_PCT.values() if x < 0)
+        lines.append(f"📊 Breadth (Nifty 50): {adv} 🟢 / {dec} 🔴")
+        if LAST_PCT:
+            top = max(LAST_PCT, key=LAST_PCT.get)
+            bot = min(LAST_PCT, key=LAST_PCT.get)
+            lines.append(f"🏆 Top: {top} {LAST_PCT[top]:+.2f}% • 🥵 Bottom: {bot} {LAST_PCT[bot]:+.2f}%")
+    except Exception as e:
+        print("Report breadth error:", e)
+    try:
+        global IDX_TOKENS
+        if not IDX_TOKENS:
+            IDX_TOKENS = find_index_tokens()
+        sq = quote_full(api, [t for k, t in IDX_TOKENS.items() if k not in ("NIFTY 50", "BANK NIFTY")])
+        inv = {t: k for k, t in IDX_TOKENS.items()}
+        secs = sorted(((inv[t], float(d.get("percentChange") or 0)) for t, d in sq.items() if t in inv),
+                      key=lambda x: x[1], reverse=True)
+        strong = [f"{k} {p:+.1f}%" for k, p in secs[:2] if p > 0]
+        weak = [f"{k} {p:+.1f}%" for k, p in secs[::-1][:2] if p < 0]
+        if strong or weak:
+            lines.append("🏭 Strong: " + (", ".join(strong) or "—") + " • Weak: " + (", ".join(weak) or "—"))
+    except Exception as e:
+        print("Report sector error:", e)
+
+    # --- signals ---
+    lines += ["", f"🎯 <b>Signals</b> (aaj {len(trades)})"]
+    if trades:
+        eq = fno_and_tokens()[1] or {}
+        open_ltp = {}
+        try:
+            oq = quote_full(api, [eq.get(t["sym"]) or tokens.get(t["sym"]) for t in trades if t["status"] == "OPEN"])
+            for t in trades:
+                tok = str(eq.get(t["sym"]) or tokens.get(t["sym"]) or "")
+                if tok in oq:
+                    open_ltp[t["sym"]] = float(oq[tok].get("ltp") or 0)
+        except Exception as e:
+            print("Report open ltp error:", e)
+        rs = [(t, trade_r(t, open_ltp.get(t["sym"]))) for t in trades]
+        cnt = {k: sum(1 for t in trades if t["status"] == k) for k in ("TARGET", "BE", "SL", "EXIT", "OPEN")}
+        t1only = sum(1 for t in trades if t.get("t1hit") and t["status"] == "OPEN")
+        wins = sum(1 for _, r in rs if r > 0)
+        net = sum(r for _, r in rs)
+        lines.append(f"🎯🎯 T2: {cnt['TARGET']} • 🔒 T1→BE: {cnt['BE']} • 🎯 T1 (open): {t1only}")
+        lines.append(f"🛑 SL: {cnt['SL']} • ⚠️ Exit: {cnt['EXIT']} • ⏳ Open: {cnt['OPEN']}")
+        lines.append(f"✅ Profit wale: {wins}/{len(trades)} ({wins / len(trades) * 100:.0f}%) • "
+                     f"<b>Net {net:+.1f}R</b> (T1 pe aadha book maan ke)")
+        for kind, label in (("EMA", "🚀 EMA"), ("REV", "🔄 Reversal"), ("SMC", "🧠 SMC")):
+            kr = [(t, r) for t, r in rs if t.get("kind", "EMA") == kind]
+            if kr:
+                lines.append(f"{label}: {len(kr)} signals • net {sum(r for _, r in kr):+.1f}R • "
+                             f"SL {sum(1 for t, _ in kr if t['status'] == 'SL')}")
+        best = max(rs, key=lambda x: x[1])
+        worst = min(rs, key=lambda x: x[1])
+        lines.append(f"🏅 Best: {best[0]['sym']} {best[1]:+.1f}R • 💔 Worst: {worst[0]['sym']} {worst[1]:+.1f}R")
+        opn = [t for t in trades if t["status"] == "OPEN"]
+        if opn:
+            lines.append("⏳ Open trades (3:30 se pehle band kar lo): " +
+                         ", ".join(f"{t['sym']} {t['side']}" for t in opn))
+    else:
+        lines.append("Aaj koi signal nahi aaya.")
+
+    # --- kal ke liye ---
+    pts, why = 0, []
+    if day_pc is not None:
+        pts += 1 if day_pc > 0 else -1
+        why.append(f"Nifty aaj {'upar' if day_pc > 0 else 'neeche'} ({day_pc:+.2f}%)")
+    if pos is not None:
+        if pos >= 0.7:
+            pts += 1
+            why.append("din ke high ke paas band — buyers strong")
+        elif pos <= 0.3:
+            pts -= 1
+            why.append("din ke low ke paas band — sellers strong")
+    if adv + dec:
+        pts += 1 if adv > dec else -1 if dec > adv else 0
+        why.append(f"breadth {'positive' if adv > dec else 'negative' if dec > adv else 'flat'}")
+    if vix_pc is not None:
+        pts += 1 if vix_pc < 0 else -1
+        why.append(f"VIX {'gira' if vix_pc < 0 else 'badha'}")
+    tilt = "🟢 halka BULLISH" if pts >= 2 else "🔴 halka BEARISH" if pts <= -2 else "🟡 NEUTRAL / mixed"
+    lines += ["", f"🔭 <b>Kal ke liye</b> (aaj ke data se): {tilt}",
+              "• " + "\n• ".join(why) if why else "",
+              "⚠️ Asli opening raat ke US market pe depend karegi — kal 9:05 IST ka prediction dekhna.",
+              "<i>Sirf andaaza hai, guarantee nahi.</i>"]
+    tg("\n".join(x for x in lines if x is not None), as_html=True)
+
+
 def build_watch(api, tokens, title):
     g, l = movers(api, tokens)
     watch = [s for s in FIXED if s in tokens] + [x[0] for x in g] + [x[0] for x in l]
@@ -1761,7 +1983,9 @@ def main():
     missing = [s for s in FIXED + UNIVERSE if s.upper() not in tokens]
     api = login()
     seen, trades = set(), []
-    watch, msg = build_watch(api, tokens, "✅ <b>Scanner chalu ho gaya</b> (Reversal + EMA)")
+    resumed = load_state(seen, trades)
+    watch, msg = build_watch(api, tokens, "✅ <b>Scanner chalu ho gaya</b> (Reversal + EMA)"
+                             if not resumed else "▶️ <b>Scanner part 2 chalu</b> (3:30 tak)")
     if missing:
         msg += "\n\n⚠️ Ye symbol nahi mile: " + ", ".join(missing)
     tg(msg, as_html=True)
@@ -1786,6 +2010,9 @@ def main():
         mopen = now.replace(hour=9, minute=15, second=0, microsecond=0)
         mclose = now.replace(hour=15, minute=30, second=0, microsecond=0)
         if now.weekday() >= 5 or now > mclose + timedelta(minutes=2):
+            break
+        if RUN_PART == "1" and now >= now.replace(hour=int(PART1_STOP[:2]), minute=int(PART1_STOP[3:]),
+                                                  second=0, microsecond=0):
             break
         # har POLL_SEC second jaago (:01, :06, :11 ...) — candle close ke 1 second baad check
         wait = (1 - now.second) % POLL_SEC or POLL_SEC
@@ -1850,6 +2077,18 @@ def main():
                     err_count = 0
                 time.sleep(0.05)
 
+        global REPORT_SENT
+        rep_t = now.replace(hour=int(REPORT_AT[:2]), minute=int(REPORT_AT[3:]), second=0, microsecond=0)
+        if not REPORT_SENT and rep_t <= now < rep_t + timedelta(minutes=8):
+            REPORT_SENT = True
+            try:
+                daily_report(api, trades, tokens)
+            except Exception as e:
+                print("Report error:", e)
+                tg(f"⚠️ Daily report nahi ban paya: {str(e)[:150]}")
+        if now.minute % 10 == 0:
+            save_state(seen, trades)
+
         # news / mood signals ke BAAD, taaki alert late na ho
         if MOOD_ON:
             for mt in MOOD_TIMES:
@@ -1868,7 +2107,8 @@ def main():
             except Exception as e:
                 print("News scan error:", e)
 
-    if traded_today:
+    save_state(seen, trades)
+    if traded_today and RUN_PART != "1" and not REPORT_SENT:
         tg(summary(trades), as_html=True)
     print("Scanner band.")
 
