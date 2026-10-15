@@ -3,8 +3,12 @@ name: EMA Scanner
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ema-scanner
+  cancel-in-progress: true
+
 jobs:
-  scan:
+  part1:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
@@ -15,6 +19,38 @@ jobs:
       - run: pip install smartapi-python pyotp requests logzero websocket-client matplotlib
       - run: python scanner.py
         env:
+          RUN_PART: "1"
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: state
+          path: state.json
+          if-no-files-found: ignore
+
+  part2:
+    needs: part1
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install smartapi-python pyotp requests logzero websocket-client matplotlib
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: state
+      - run: python scanner.py
+        env:
+          RUN_PART: "2"
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
