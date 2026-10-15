@@ -41,6 +41,8 @@ LIVE_ON        = True        # live price se khud candle banao (Angel ka candle 
 POLL_SEC       = 5           # live price har kitne second me lein
 HIST_REFRESH_MIN = 10        # Angel ki candle history har kitne min me dobara lein (beech me live candles)
 COMMANDS_ON    = True        # Telegram pe /FMCG, /IT, /BANK ... likhne pe us sector ke F&O shares ki list
+PREDICT_ON     = True        # subah 9:05 IST pe NIFTY opening prediction (US + VIX + Breadth) + backtest
+GAP_PCT        = 0.20        # isse zyada = Gap Up, isse kam (minus) = Gap Down, beech me = Flat
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
 MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
@@ -1362,6 +1364,7 @@ SECTOR_CACHE = {}
 FNO_SET = None
 EQ_TOKEN = None
 TG_OFFSET = None
+CMD_TOKENS = {}
 
 
 def fno_and_tokens():
@@ -1429,7 +1432,7 @@ def sector_reply(api, key):
 def help_text():
     cmds = "  ".join("/" + k for k in SECTORS)
     return ("🤖 <b>Commands</b>\n\nSector ke F&amp;O shares % ke hisaab se:\n" + cmds +
-            "\n\n/SECTORS — saare sectors ka mood\n/HELP — yeh list\n\n"
+            "\n\n/PREDICT — NIFTY opening prediction\n/SECTORS — saare sectors ka mood\n/HELP — yeh list\n\n"
             "<i>Bot sirf market time me jawab deta hai (scanner chalu hone par).</i>")
 
 
@@ -1438,7 +1441,8 @@ def setup_commands():
     global TG_OFFSET
     try:
         cmds = [{"command": k.lower(), "description": f"{SECTORS[k][0]} F&O shares % wise"} for k in SECTORS]
-        cmds += [{"command": "sectors", "description": "Saare sectors ka mood"},
+        cmds += [{"command": "predict", "description": "NIFTY opening prediction + backtest"},
+                 {"command": "sectors", "description": "Saare sectors ka mood"},
                  {"command": "help", "description": "Commands list"}]
         requests.post(f"{TG_URL}/setMyCommands", data={"commands": json.dumps(cmds)}, timeout=15)
         r = requests.get(f"{TG_URL}/getUpdates", params={"offset": -1, "timeout": 0}, timeout=15).json()
@@ -1469,6 +1473,8 @@ def handle_commands(api):
                 tg(sector_reply(api, cmd), as_html=True)
             elif cmd == "SECTORS":
                 market_mood(api, datetime.now(IST))
+            elif cmd in ("PREDICT", "PREDICTION", "OPENING"):
+                opening_prediction(api, CMD_TOKENS)
             elif cmd == "HELP":
                 tg(help_text(), as_html=True)
             elif text.startswith("/"):
@@ -1476,6 +1482,249 @@ def handle_commands(api):
         except Exception as e:
             print("Command error", cmd, e)
             tg(f"⚠️ {cmd} ka data abhi nahi mila, thodi der baad try karo.")
+
+
+# ----------------------------- NIFTY OPENING PREDICTION -----------------------------
+def yahoo_daily(sym, rng="2y"):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(sym)}?range={rng}&interval=1d"
+    j = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20).json()
+    r = j["chart"]["result"][0]
+    tz = ZoneInfo(r["meta"].get("exchangeTimezoneName") or "America/New_York")
+    q = r["indicators"]["quote"][0]
+    out = []
+    for t, o, c in zip(r["timestamp"], q["open"], q["close"]):
+        if c is not None:
+            out.append((datetime.fromtimestamp(t, tz).date(), float(o or c), float(c)))
+    return out
+
+
+def stooq_daily(sym):
+    txt = requests.get(f"https://stooq.com/q/d/l/?s={sym}&i=d", timeout=20,
+                       headers={"User-Agent": "Mozilla/5.0"}).text.strip().splitlines()
+    out = []
+    for ln in txt[1:]:
+        p = ln.split(",")
+        try:
+            out.append((datetime.strptime(p[0], "%Y-%m-%d").date(), float(p[1]), float(p[4])))
+        except Exception:
+            pass
+    return out[-520:]
+
+
+def us_daily(yahoo_sym, stooq_sym):
+    try:
+        d = yahoo_daily(yahoo_sym)
+        if len(d) > 50:
+            return d
+    except Exception as e:
+        print("Yahoo error", yahoo_sym, e)
+    return stooq_daily(stooq_sym)
+
+
+def us_last15(yahoo_sym):
+    """US ke aakhri session ki aakhri 15-min candle green ya red."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(yahoo_sym)}?range=5d&interval=15m"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20).json()["chart"]["result"][0]
+        q = r["indicators"]["quote"][0]
+        bars = [(o, c) for o, c in zip(q["open"], q["close"]) if o is not None and c is not None]
+        o, c = bars[-1]
+        return c - o
+    except Exception as e:
+        print("US 15m error", yahoo_sym, e)
+        return None
+
+
+def angel_daily(api, token, days=420):
+    now = datetime.now(IST)
+    res = api.getCandleData({"exchange": "NSE", "symboltoken": str(token), "interval": "ONE_DAY",
+                             "fromdate": (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+                             "todate": now.strftime("%Y-%m-%d %H:%M")})
+    return [(datetime.fromisoformat(r[0]).date(), float(r[1]), float(r[4])) for r in (res or {}).get("data") or []]
+
+
+def index_token(names, default=None):
+    for r in SCRIP_DATA or []:
+        if r.get("exch_seg") == "NSE" and r.get("instrumenttype") == "AMXIDX":
+            if {str(r.get("symbol", "")).lower(), str(r.get("name", "")).lower()} & set(names):
+                return str(r["token"])
+    return default
+
+
+def prev_on_or_before(series_dates, d, strict=True):
+    """series me d se pehle (strict) ka aakhri index."""
+    best = None
+    for i, x in enumerate(series_dates):
+        if (x < d) if strict else (x <= d):
+            best = i
+        else:
+            break
+    return best
+
+
+def factor_row(D, nifty, nas, dow, vix, breadth):
+    """Trading day D ke liye 4 factor-signals (US2 + VIX + Breadth). None = data nahi."""
+    nd = [x[0] for x in nifty]
+    pi = prev_on_or_before(nd, D)
+    if pi is None or pi < 1:
+        return None
+    prevD = nd[pi]
+    sig = {}
+    for name, ser in (("Nasdaq", nas), ("Dow", dow)):
+        dd = [x[0] for x in ser]
+        k = prev_on_or_before(dd, D)
+        if k is None or k < 1:
+            return None
+        ch = (ser[k][2] / ser[k - 1][2] - 1) * 100
+        sig[name] = (1 if ch > 0 else -1, ch, ser[k][2], ser[k][0])
+    vd = [x[0] for x in vix]
+    k = prev_on_or_before(vd, prevD, strict=False)
+    if k is None or k < 1:
+        return None
+    vch = (vix[k][2] / vix[k - 1][2] - 1) * 100
+    sig["VIX"] = (1 if vch < 0 else -1, vch, vix[k][2], vix[k][0])
+    b = breadth.get(prevD)
+    if not b:
+        return None
+    adv, dec = b
+    sig["Breadth"] = (1 if adv > dec else -1 if adv < dec else 0, adv / max(1, dec), adv, dec)
+    return prevD, sig
+
+
+def score_pred(sig):
+    sc = sum(v[0] for v in sig.values())
+    if sc >= 2:
+        return sc, "GAP UP", "BULLISH"
+    if sc <= -2:
+        return sc, "GAP DOWN", "BEARISH"
+    return sc, "FLAT", "NEUTRAL"
+
+
+def outcome(gap):
+    return "GAP UP" if gap > GAP_PCT else "GAP DOWN" if gap < -GAP_PCT else "FLAT"
+
+
+def opening_prediction(api, tokens):
+    now = datetime.now(IST)
+    # --- data ---
+    nifty_tok = index_token(["nifty 50", "nifty"], "99926000")
+    nifty = angel_daily(api, nifty_tok)
+    if len(nifty) < 60:
+        nifty = yahoo_daily("^NSEI")
+    vix_tok = index_token(["india vix", "indiavix"])
+    vix = angel_daily(api, vix_tok) if vix_tok else []
+    if len(vix) < 60:
+        vix = yahoo_daily("^INDIAVIX")
+    nas = us_daily("^IXIC", "^ndq")
+    dow = us_daily("^DJI", "^dji")
+    closes = {}
+    for sym in UNIVERSE:
+        if sym in tokens:
+            try:
+                closes[sym] = {d: c for d, o, c in angel_daily(api, tokens[sym])}
+            except Exception as e:
+                print("Breadth data error", sym, e)
+            time.sleep(0.45)
+    all_days = sorted({d for m in closes.values() for d in m})
+    breadth = {}
+    for i in range(1, len(all_days)):
+        d0, d1 = all_days[i - 1], all_days[i]
+        adv = sum(1 for m in closes.values() if d0 in m and d1 in m and m[d1] > m[d0])
+        dec = sum(1 for m in closes.values() if d0 in m and d1 in m and m[d1] < m[d0])
+        breadth[d1] = (adv, dec)
+
+    # --- backtest (pichhle ~1 saal) ---
+    nd = [x[0] for x in nifty]
+    stats, total, hit, dir_total, dir_hit = {}, 0, 0, 0, 0
+    base = {"GAP UP": 0, "GAP DOWN": 0, "FLAT": 0}
+    for i in range(max(1, len(nifty) - 250), len(nifty)):
+        D = nd[i]
+        if D >= now.date():
+            continue
+        fr = factor_row(D, nifty, nas, dow, vix, breadth)
+        if not fr:
+            continue
+        prevD, sig = fr
+        pc = nifty[nd.index(prevD)][2]
+        gap = (nifty[i][1] / pc - 1) * 100
+        act = outcome(gap)
+        sc, pred, _ = score_pred(sig)
+        ok = pred == act
+        total += 1
+        hit += ok
+        base[act] += 1
+        b = stats.setdefault(sc, [0, 0, 0, 0])   # count, correct, up, down
+        b[0] += 1
+        b[1] += ok
+        b[2] += gap > 0
+        b[3] += gap < 0
+        if pred != "FLAT":
+            dir_total += 1
+            dir_hit += (gap > 0) == (pred == "GAP UP")
+
+    # --- aaj ka prediction ---
+    fr = factor_row(now.date(), nifty, nas, dow, vix, breadth)
+    if not fr:
+        tg("⚠️ Opening prediction: aaj ka poora data nahi mila.")
+        return
+    prevD, sig = fr
+    sc, pred, bias = score_pred(sig)
+    b = stats.get(sc)
+    if b and b[0] >= 8:
+        conf = b[1] / b[0] * 100
+        conf_txt = f"{conf:.0f}% (backtest me score {sc:+d} wale {b[0]} din me se {b[1]} sahi)"
+    else:
+        conf = hit / total * 100 if total else 0
+        conf_txt = f"{conf:.0f}% (overall backtest; score {sc:+d} ke din kam the)"
+
+    def col(x):
+        return "🟢" if x > 0 else "🔴"
+    n15 = us_last15("^IXIC")
+    d15 = us_last15("^DJI")
+    t15 = lambda v: "" if v is None else f" • last 15m {'🟢' if v > 0 else '🔴'}"
+    nsig, dsig, vsig, bsig = sig["Nasdaq"], sig["Dow"], sig["VIX"], sig["Breadth"]
+    stable = "Stable (&lt;15)" if vsig[2] < 15 else "Volatile (&gt;15)"
+    want = 1 if pred == "GAP UP" else -1 if pred == "GAP DOWN" else 0
+    names = {"Nasdaq": "Nasdaq", "Dow": "Dow Jones", "VIX": "India VIX", "Breadth": "Breadth"}
+    sup = [names[k] for k, v in sig.items() if want and v[0] == want]
+    agn = [names[k] for k, v in sig.items() if want and v[0] == -want]
+    emo = {"GAP UP": "📈", "GAP DOWN": "📉", "FLAT": "➖"}[pred]
+    bemo = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "🟡"}[bias]
+    base_best = max(base.values()) / total * 100 if total else 0
+    lines = [
+        f"🔮 <b>NIFTY 50 OPENING PREDICTION</b>",
+        f"{now:%d-%b-%Y} • data {now:%H:%M} IST • opening 9:15",
+        "",
+        f"🇺🇸 <b>US market</b> (session {nsig[3]:%d-%b})",
+        f"{col(nsig[0])} Nasdaq {nsig[2]:,.0f} ({nsig[1]:+.2f}%){t15(n15)}",
+        f"{col(dsig[0])} Dow Jones {dsig[2]:,.0f} ({dsig[1]:+.2f}%){t15(d15)}",
+        "",
+        f"😰 <b>India VIX</b>: {vsig[2]:.2f} ({vsig[1]:+.2f}% {'⬇️ gira' if vsig[1] < 0 else '⬆️ badha'}) • {stable}",
+        "",
+        f"📊 <b>Breadth</b> ({prevD:%d-%b}, Nifty 50): {bsig[2]} 🟢 / {bsig[3]} 🔴 • A/D {bsig[1]:.2f} "
+        f"→ {'Positive' if bsig[0] > 0 else 'Negative' if bsig[0] < 0 else 'Neutral'}",
+        "",
+        "🌏 SGX/GIFT Nifty: shamil nahi (free data/backtest possible nahi)",
+        "━━━━━━━━━━━━━━",
+        f"Score: <b>{sc:+d}</b> / 4",
+        f"{emo} Expected opening: <b>{pred}</b>",
+        f"{bemo} Bias: <b>{bias}</b>",
+        f"🎯 Confidence: <b>{conf_txt}</b>",
+    ]
+    if vsig[2] >= 15:
+        lines.append("⚠️ VIX 15 se upar — volatile din, gap ke baad tez ulta move ho sakta hai")
+    if want:
+        lines.append(f"✅ Support: {', '.join(sup) or '—'}")
+        lines.append(f"❌ Against: {', '.join(agn) or '—'}")
+    else:
+        lines.append("➖ Factors mixed hain, koi saaf direction nahi")
+    lines += ["", f"📚 <b>Backtest</b> ({total} din, ~1 saal):",
+              f"• Exact (Gap Up/Flat/Gap Down) sahi: <b>{hit / total * 100 if total else 0:.0f}%</b>",
+              f"• Direction (Up vs Down) sahi: <b>{dir_hit / dir_total * 100 if dir_total else 0:.0f}%</b> "
+              f"({dir_total} din jab Gap Up/Down bola)",
+              f"• Tulna: hamesha '{max(base, key=base.get)}' bolne se {base_best:.0f}% sahi hota",
+              "<i>Sirf andaaza hai, guarantee nahi. Breadth = aaj ke Nifty 50 shares (purane din bhi).</i>"]
+    tg("\n".join(lines), as_html=True)
 
 
 def build_watch(api, tokens, title):
@@ -1516,9 +1765,16 @@ def main():
     if missing:
         msg += "\n\n⚠️ Ye symbol nahi mile: " + ", ".join(missing)
     tg(msg, as_html=True)
+    if PREDICT_ON and RUN_START.hour < 10:
+        try:
+            opening_prediction(api, tokens)
+        except Exception as e:
+            print("Prediction error:", e)
+            tg(f"⚠️ Opening prediction nahi ban paya: {str(e)[:150]}")
     if NEWS_ON and RUN_START.hour < 10:
         premarket_news(RUN_START)
     if COMMANDS_ON:
+        CMD_TOKENS.update(tokens)
         setup_commands()
     last_refresh = datetime.now(IST)
     traded_today = False
