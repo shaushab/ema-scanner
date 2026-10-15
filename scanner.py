@@ -26,6 +26,10 @@ STRATEGY_EMA      = True     # EMA 9/21 crossover signals
 STRATEGY_REVERSAL = True     # Reversal (bottom/top) signals
 RSI_LOW, RSI_HIGH = 40, 60   # reversal ke liye RSI kitna neeche/upar gaya ho (30/70 = kam par strong signal)
 REV_WITH_TREND = True        # True = sirf trend (EMA200) ki direction me reversal entry
+EXHAUST_ON = True            # trend ke ulta bhi reversal do agar giraawat/chadhaav 'exhaust' ho gaya ho (V-reversal)
+EXHAUST_RSI_LOW, EXHAUST_RSI_HIGH = 30, 70   # exhaustion ke liye RSI kitna extreme gaya ho
+EXHAUST_STRETCH_ATR = 1.5    # price EMA21 se kam se kam itne ATR door gaya ho
+MAX_EXHAUST_RISK_PCT = 1.3   # V-reversal me candles badi hoti hain, isliye SL thoda door allowed
 WHIPSAW_MIN = 30             # usi share pe itne min me ulta EMA crossover hua ho toh naya EMA signal skip
 SL_COOLDOWN_MIN = 45         # kisi share pe SL lage toh itne min tak us share pe naya signal nahi
 MAX_SIGNALS_PER_STOCK = 3    # ek share pe din me zyada se zyada itne naye signals
@@ -33,6 +37,8 @@ NEWS_ON        = True        # watchlist shares ki news Telegram pe
 NEWS_EVERY_MIN = 20          # har kitne minute me news check ho
 MOOD_ON        = True        # market mood + sectoral movement
 MOOD_TIMES     = ["09:21", "11:30", "13:30"]   # IST me kab-kab market mood bheje
+LIVE_ON        = True        # live price se khud candle banao (Angel ka candle data late aaye toh bhi alert turant)
+POLL_SEC       = 10          # live price har kitne second me lein
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
 MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
@@ -340,10 +346,76 @@ def make_chart(sym, tf, c, f, s, side, entry, sl, t1, tgt, title=None):
     return buf.getvalue()
 
 
+# ----------------------------- LIVE CANDLES (late data ka ilaaj) -----------------------------
+LIVE1M = {}       # token -> {minute_start: [open, high, low, close, volume]}
+LAST_DAY = {}     # token -> (day_high, day_low, day_volume)
+
+
+def poll_live(api, toks):
+    """Har POLL_SEC second me live price lekar 1-minute candles banao."""
+    if not toks:
+        return
+    res = api.getMarketData("FULL", {"NSE": list(dict.fromkeys(toks))[:50]})
+    now = datetime.now(IST)
+    m = now.replace(second=0, microsecond=0)
+    for d in ((res or {}).get("data") or {}).get("fetched") or []:
+        tok = str(d.get("symbolToken"))
+        try:
+            ltp = float(d["ltp"])
+        except Exception:
+            continue
+        dh = float(d.get("high") or ltp)
+        dl = float(d.get("low") or ltp)
+        dvol = float(d.get("tradeVolume") or 0)
+        hi = lo = ltp
+        prev = LAST_DAY.get(tok)
+        if prev:                       # din ka naya high/low bana ho toh exact extreme pakdo
+            if dh > prev[0]:
+                hi = max(hi, dh)
+            if dl < prev[1]:
+                lo = min(lo, dl)
+        vol = max(0.0, dvol - prev[2]) if prev else 0.0
+        LAST_DAY[tok] = (dh, dl, dvol)
+        book = LIVE1M.setdefault(tok, {})
+        cdl = book.get(m)
+        if cdl is None:
+            book[m] = [ltp, hi, lo, ltp, vol]
+        else:
+            cdl[1] = max(cdl[1], hi)
+            cdl[2] = min(cdl[2], lo)
+            cdl[3] = ltp
+            cdl[4] += vol
+
+
+def merge_live(token, tf, c):
+    """Angel ki history me jo aakhri candles abhi nahi aayi, unhe live data se jodo."""
+    if not LIVE_ON or not c:
+        return c
+    book = LIVE1M.get(str(token))
+    if not book:
+        return c
+    now = datetime.now(IST)
+    out = list(c)
+    nxt = out[-1][0] + timedelta(minutes=tf)
+    while nxt + timedelta(minutes=tf) <= now and nxt.date() == now.date():
+        mins = [nxt + timedelta(minutes=k) for k in range(tf)]
+        if mins[0] not in book:                 # candle ki shuruaat ka data nahi — history ka intezaar
+            break
+        parts = [book[x] for x in mins if x in book]
+        o = parts[0][0]
+        h = max(p[1] for p in parts)
+        l = min(p[2] for p in parts)
+        cl = parts[-1][3]
+        v = sum(p[4] for p in parts)
+        out.append((nxt, o, h, l, cl, v))
+        nxt += timedelta(minutes=tf)
+    return out
+
+
 # ----------------------------- SIGNALS -----------------------------
 def check(api, sym, token, tf, seen, trades):
     hs = html.escape(sym)
-    c = candles(api, token, tf)
+    c = merge_live(token, tf, candles(api, token, tf))
     if len(c) < SLOW + 5:
         return
     closes = [x[4] for x in c]
@@ -421,6 +493,8 @@ def check(api, sym, token, tf, seen, trades):
         # --- 1) REVERSAL (bottom / top pe entry) ---
         if STRATEGY_REVERSAL and (sym, tf, t, "REV") not in seen:
             rev = reversal_at(c, f, rs, idx)
+            exhaust = bool(rev) and rev.endswith("*")
+            rev = rev.rstrip("*") if rev else rev
             if rev:
                 seen.add((sym, tf, t, "REV"))          # har candle ka faisla sirf ek baar
                 last = LAST_REV.get((sym, tf, rev))
@@ -433,7 +507,7 @@ def check(api, sym, token, tf, seen, trades):
                     count_sig(sym)
                     LAST_REV[(sym, tf, rev)] = t
                     send_reversal(sym, tf, c[:idx + 1], f[:idx + 1], s[:idx + 1], rs[:idx + 1],
-                                  rev == "BUY", trades, c[-1][4], now)
+                                  rev == "BUY", trades, c[-1][4], now, exhaust)
 
         # --- 2) EMA CROSSOVER ---
         if STRATEGY_EMA:
@@ -459,9 +533,29 @@ def check(api, sym, token, tf, seen, trades):
                     print(f"Skip EMA {side} {sym} {t:%H:%M}: " + ("whipsaw" if whipsaw else "cooldown/limit"))
 
 
+def exhausted(c, idx, rwin, bull):
+    """Trend ke ulta reversal tabhi jab move 'thak' gaya ho: RSI extreme + price EMA21 se bahut door + volume/badi candle."""
+    closes = [x[4] for x in c[:idx + 1]]
+    e21 = ema(closes, 21)
+    trs = [max(c[i][2] - c[i][3], abs(c[i][2] - c[i - 1][4]), abs(c[i][3] - c[i - 1][4]))
+           for i in range(max(1, idx - 14), idx + 1)]
+    atr = sum(trs) / len(trs) if trs else 0
+    win = range(idx - REV_LOOKBACK, idx + 1)
+    t, o, h, l, cl, v = c[idx]
+    avg_vol = avg(c[i][5] for i in range(max(0, idx - 20), idx)) or 1
+    avg_body = avg(abs(c[i][4] - c[i][1]) for i in range(max(1, idx - 10), idx)) or 1e-9
+    power = v >= 1.3 * avg_vol or abs(cl - o) >= 1.2 * avg_body
+    if bull:
+        stretch = max(e21[i] - c[i][3] for i in win)
+        return min(rwin) < EXHAUST_RSI_LOW and atr > 0 and stretch >= EXHAUST_STRETCH_ATR * atr and power
+    stretch = max(c[i][2] - e21[i] for i in win)
+    return max(rwin) > EXHAUST_RSI_HIGH and atr > 0 and stretch >= EXHAUST_STRETCH_ATR * atr and power
+
+
 def reversal_at(c, f, rs, idx):
     """Jaldi reversal: fresh swing low/high pe ulti candle (engulf / break / hammer) + RSI mud raha ho.
-    Bottom/top ke 1 candle ke andar signal deta hai — EMA crossover ka intezaar nahi."""
+    Bottom/top ke 1 candle ke andar signal deta hai — EMA crossover ka intezaar nahi.
+    Return: "BUY" / "SELL" (trend ke saath) ya "BUY*" / "SELL*" (exhaustion, trend ke ulta)."""
     t, o, h, l, cl, v = c[idx]
     prev = c[idx - 1]
     win = c[idx - REV_LOOKBACK: idx + 1]
@@ -478,6 +572,8 @@ def reversal_at(c, f, rs, idx):
     if fresh_low and (engulf_up or hammer) and min(rwin) < RSI_LOW and rs[idx] > rs[idx - 1]:
         if not REV_WITH_TREND or e200 is None or cl > e200:
             return "BUY"
+        if EXHAUST_ON and exhausted(c, idx, rwin, True):
+            return "BUY*"
 
     # --- SELL: abhi-abhi naya high bana aur ulti red candle ---
     fresh_high = max(h, prev[2]) >= max(x[2] for x in win) - 1e-9
@@ -486,10 +582,12 @@ def reversal_at(c, f, rs, idx):
     if fresh_high and (engulf_dn or star) and max(rwin) > RSI_HIGH and rs[idx] < rs[idx - 1]:
         if not REV_WITH_TREND or e200 is None or cl < e200:
             return "SELL"
+        if EXHAUST_ON and exhausted(c, idx, rwin, False):
+            return "SELL*"
     return None
 
 
-def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
+def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now, exhaust=False):
     hs = html.escape(sym)
     t, o, h, l, cl, vol = c[-1]
     win = c[-(REV_LOOKBACK + 1):]
@@ -502,7 +600,7 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
         swing = max(x[2] for x in win)
         sl = swing + buf
         risk = sl - cl
-    if risk > cl * MAX_REV_RISK_PCT / 100:
+    if risk > cl * (MAX_EXHAUST_RISK_PCT if exhaust else MAX_REV_RISK_PCT) / 100:
         print(f"Reversal skip {sym}: SL bahut door ({risk:.2f})")
         return
     if risk < cl * MIN_RISK_PCT / 100:
@@ -540,11 +638,13 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now):
     if late >= 3:
         timing += f"\n⚠️ Data {late} min late aaya — abhi price {ltp:.2f}"
     pct = lambda a: abs(a - cl) / cl * 100
+    if exhaust:
+        notes.insert(0, "⚡ <b>Exhaustion reversal</b> — trend ke ulta, tez giraawat/chadhaav ke baad palta")
     if bull:
-        head = "🔄🟢 <b>REVERSAL BUY</b> ⬆️"
+        head = "🔄🟢 <b>REVERSAL BUY</b> ⬆️" + (" ⚡" if exhaust else "")
         why = f"Naya low bana, phir green rejection candle (RSI {extreme:.0f} se palta)"
     else:
-        head = "🔄🔴 <b>REVERSAL SELL</b> ⬇️"
+        head = "🔄🔴 <b>REVERSAL SELL</b> ⬇️" + (" ⚡" if exhaust else "")
         why = f"Naya high bana, phir red rejection candle (RSI {extreme:.0f} se palta)"
     caption = (f"{head}\n<b><code>{hs}</code></b> • {tf}m • {t:%d-%b %H:%M}\n{why}\n{timing}\n\n"
                f"💰 Entry:  <code>{cl:.2f}</code>\n"
@@ -1211,17 +1311,33 @@ def main():
     traded_today = False
     err_count, last_err, last_err_alert = 0, "", 0.0
 
+    last_scan_min = None
     while time.time() - start < MAX_RUN_MIN * 60:
         now = datetime.now(IST)
         mopen = now.replace(hour=9, minute=15, second=0, microsecond=0)
         mclose = now.replace(hour=15, minute=30, second=0, microsecond=0)
         if now.weekday() >= 5 or now > mclose + timedelta(minutes=2):
             break
-        nxt = (now + timedelta(minutes=1)).replace(second=20, microsecond=0)
-        time.sleep(max(1, (nxt - datetime.now(IST)).total_seconds()))
+        # har POLL_SEC second (second ke 2 pe: :02, :12, :22 ...) jaago
+        wait = (2 - now.second) % POLL_SEC or POLL_SEC
+        time.sleep(max(0.5, wait - now.microsecond / 1e6))
         now = datetime.now(IST)
-        if now < mopen + timedelta(minutes=1):
+        if now < mopen:
             continue
+
+        open_syms = [t["sym"] for t in trades if t["status"] == "OPEN"] + \
+            [p["sym"] for p in SMC_PLANS if p["status"] == "WAIT"]
+        scan = list(dict.fromkeys(watch + open_syms))
+        if LIVE_ON and now <= mclose + timedelta(minutes=1):
+            try:
+                poll_live(api, [tokens[s] for s in scan if s in tokens])
+            except Exception as e:
+                print("Live poll error:", e)
+
+        minute_key = now.replace(second=0, microsecond=0)
+        if minute_key == last_scan_min or now < mopen + timedelta(minutes=1):
+            continue
+        last_scan_min = minute_key
         traded_today = True
 
         first_open = mopen + timedelta(minutes=5)
@@ -1235,27 +1351,9 @@ def main():
             except Exception as e:
                 print("Movers update error:", e)
             last_refresh = now
+            scan = list(dict.fromkeys(watch + open_syms))
 
-        if MOOD_ON:
-            for mt in MOOD_TIMES:
-                hh, mm = map(int, mt.split(":"))
-                mt_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-                if mt not in MOOD_SENT and mt_dt <= now < mt_dt + timedelta(minutes=10):
-                    MOOD_SENT.add(mt)
-                    try:
-                        market_mood(api, now)
-                    except Exception as e:
-                        print("Mood error:", e)
-        if NEWS_ON and (LAST_NEWS_SCAN is None or now - LAST_NEWS_SCAN >= timedelta(minutes=NEWS_EVERY_MIN)):
-            try:
-                scan_news(watch, now)
-            except Exception as e:
-                print("News scan error:", e)
-
-        open_syms = [t["sym"] for t in trades if t["status"] == "OPEN"] + \
-            [p["sym"] for p in SMC_PLANS if p["status"] == "WAIT"]
-        scan = list(dict.fromkeys(watch + open_syms))
-        for tf in TIMEFRAMES:                     # har minute check (data late ho toh bhi pakde)
+        for tf in TIMEFRAMES:                     # har minute check (candle close ke turant baad)
             for sym in scan:
                 try:
                     check(api, sym, tokens[sym], tf, seen, trades)
@@ -1278,7 +1376,25 @@ def main():
                            f"Last: {last_err[:200]}\nScanner chal raha hai, retry kar raha hai.")
                 else:
                     err_count = 0
-                time.sleep(0.5)
+                time.sleep(0.4)
+
+        # news / mood signals ke BAAD, taaki alert late na ho
+        if MOOD_ON:
+            for mt in MOOD_TIMES:
+                hh, mm = map(int, mt.split(":"))
+                mt_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if mt not in MOOD_SENT and mt_dt <= now < mt_dt + timedelta(minutes=10):
+                    MOOD_SENT.add(mt)
+                    try:
+                        market_mood(api, now)
+                    except Exception as e:
+                        print("Mood error:", e)
+        if NEWS_ON and now.minute % 5 not in (0, 1) and \
+                (LAST_NEWS_SCAN is None or now - LAST_NEWS_SCAN >= timedelta(minutes=NEWS_EVERY_MIN)):
+            try:
+                scan_news(watch, now)
+            except Exception as e:
+                print("News scan error:", e)
 
     if traded_today:
         tg(summary(trades), as_html=True)
