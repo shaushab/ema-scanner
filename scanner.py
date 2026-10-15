@@ -21,7 +21,7 @@ MIN_RISK_PCT = 0.15          # SL kam se kam itna % door
 MAX_RISK_PCT = 0.5           # SL zyada se zyada itna % door (target realistic rahe)
 REFRESH_MIN = 30             # gainers/losers list har kitne minute me update ho
 BIG_EMOJI   = True           # alert se pehle bada 🚀 / 🔻 emoji
-MAX_LATE    = 20             # data late aaye toh bhi itne minute tak ka crossover pakdo
+MAX_LATE    = 1              # candle band hone ke 1 min ke andar hi alert; isse late = skip
 STRATEGY_EMA      = True     # EMA 9/21 crossover signals
 STRATEGY_REVERSAL = True     # Reversal (bottom/top) signals
 RSI_LOW, RSI_HIGH = 40, 60   # reversal ke liye RSI kitna neeche/upar gaya ho (30/70 = kam par strong signal)
@@ -38,7 +38,8 @@ NEWS_EVERY_MIN = 20          # har kitne minute me news check ho
 MOOD_ON        = True        # market mood + sectoral movement
 MOOD_TIMES     = ["09:21", "11:30", "13:30"]   # IST me kab-kab market mood bheje
 LIVE_ON        = True        # live price se khud candle banao (Angel ka candle data late aaye toh bhi alert turant)
-POLL_SEC       = 10          # live price har kitne second me lein
+POLL_SEC       = 5           # live price har kitne second me lein
+HIST_REFRESH_MIN = 10        # Angel ki candle history har kitne min me dobara lein (beech me live candles)
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
 MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
@@ -351,14 +352,35 @@ LIVE1M = {}       # token -> {minute_start: [open, high, low, close, volume]}
 LAST_DAY = {}     # token -> (day_high, day_low, day_volume)
 
 
+LIVE_FAILS = 0
+LIVE_WARNED = False
+
+
 def poll_live(api, toks):
-    """Har POLL_SEC second me live price lekar 1-minute candles banao."""
+    """Har POLL_SEC second me live price lekar 1-minute candles banao (saare shares, 50-50 ke group me)."""
+    global LIVE_FAILS, LIVE_WARNED
+    toks = list(dict.fromkeys(toks))
     if not toks:
         return
-    res = api.getMarketData("FULL", {"NSE": list(dict.fromkeys(toks))[:50]})
+    fetched = []
+    try:
+        for i in range(0, len(toks), 50):
+            res = api.getMarketData("FULL", {"NSE": toks[i:i + 50]})
+            fetched += ((res or {}).get("data") or {}).get("fetched") or []
+    except Exception as e:
+        print("Live poll error:", e)
+    if not fetched:
+        LIVE_FAILS += 1
+        if LIVE_FAILS >= 6 and not LIVE_WARNED:
+            LIVE_WARNED = True
+            tg("⚠️ Live price nahi mil raha — signals late ho sakte hain, isliye late signals skip honge.")
+        return
+    if LIVE_WARNED:
+        tg("✅ Live price wapas mil raha hai.")
+    LIVE_FAILS, LIVE_WARNED = 0, False
     now = datetime.now(IST)
     m = now.replace(second=0, microsecond=0)
-    for d in ((res or {}).get("data") or {}).get("fetched") or []:
+    for d in fetched:
         tok = str(d.get("symbolToken"))
         try:
             ltp = float(d["ltp"])
@@ -387,6 +409,24 @@ def poll_live(api, toks):
             cdl[4] += vol
 
 
+HIST_CACHE = {}   # (token, tf) -> (fetched_at, candles)
+
+
+def get_hist(api, token, tf, force=False):
+    """Angel ki history cache se do; har HIST_REFRESH_MIN min me hi dobara mangao (fast + rate limit safe)."""
+    key = (str(token), tf)
+    now = datetime.now(IST)
+    hit = HIST_CACHE.get(key)
+    book = LIVE1M.get(str(token)) or {}
+    live_fresh = any(now - m <= timedelta(minutes=2) for m in list(book)[-3:])
+    if not force and hit and live_fresh and now - hit[0] < timedelta(minutes=HIST_REFRESH_MIN) \
+            and LIVE_ON and not LIVE_WARNED:
+        return hit[1]                          # live candles mil rahe hain — history dobara mangane ki zarurat nahi
+    c = candles(api, token, tf)
+    HIST_CACHE[key] = (now, c)
+    return c
+
+
 def merge_live(token, tf, c):
     """Angel ki history me jo aakhri candles abhi nahi aayi, unhe live data se jodo."""
     if not LIVE_ON or not c:
@@ -397,6 +437,8 @@ def merge_live(token, tf, c):
     now = datetime.now(IST)
     out = list(c)
     nxt = out[-1][0] + timedelta(minutes=tf)
+    if out[-1][0].date() < now.date():          # history me aaj ki koi candle nahi — 9:15 se live candles
+        nxt = now.replace(hour=9, minute=15, second=0, microsecond=0)
     while nxt + timedelta(minutes=tf) <= now and nxt.date() == now.date():
         mins = [nxt + timedelta(minutes=k) for k in range(tf)]
         if mins[0] not in book:                 # candle ki shuruaat ka data nahi — history ka intezaar
@@ -415,7 +457,10 @@ def merge_live(token, tf, c):
 # ----------------------------- SIGNALS -----------------------------
 def check(api, sym, token, tf, seen, trades):
     hs = html.escape(sym)
-    c = merge_live(token, tf, candles(api, token, tf))
+    c = merge_live(token, tf, get_hist(api, token, tf))
+    now0 = datetime.now(IST)
+    if c and c[-1][0] + timedelta(minutes=2 * tf) <= now0:   # aakhri candle missing — history dobara lo
+        c = merge_live(token, tf, get_hist(api, token, tf, force=True))
     if len(c) < SLOW + 5:
         return
     closes = [x[4] for x in c]
@@ -1318,8 +1363,8 @@ def main():
         mclose = now.replace(hour=15, minute=30, second=0, microsecond=0)
         if now.weekday() >= 5 or now > mclose + timedelta(minutes=2):
             break
-        # har POLL_SEC second (second ke 2 pe: :02, :12, :22 ...) jaago
-        wait = (2 - now.second) % POLL_SEC or POLL_SEC
+        # har POLL_SEC second jaago (:01, :06, :11 ...) — candle close ke 1 second baad check
+        wait = (1 - now.second) % POLL_SEC or POLL_SEC
         time.sleep(max(0.5, wait - now.microsecond / 1e6))
         now = datetime.now(IST)
         if now < mopen:
@@ -1329,10 +1374,8 @@ def main():
             [p["sym"] for p in SMC_PLANS if p["status"] == "WAIT"]
         scan = list(dict.fromkeys(watch + open_syms))
         if LIVE_ON and now <= mclose + timedelta(minutes=1):
-            try:
-                poll_live(api, [tokens[s] for s in scan if s in tokens])
-            except Exception as e:
-                print("Live poll error:", e)
+            all_syms = list(dict.fromkeys(FIXED + UNIVERSE + scan))
+            poll_live(api, [tokens[s] for s in all_syms if s in tokens])
 
         minute_key = now.replace(second=0, microsecond=0)
         if minute_key == last_scan_min or now < mopen + timedelta(minutes=1):
@@ -1376,7 +1419,7 @@ def main():
                            f"Last: {last_err[:200]}\nScanner chal raha hai, retry kar raha hai.")
                 else:
                     err_count = 0
-                time.sleep(0.4)
+                time.sleep(0.05)
 
         # news / mood signals ke BAAD, taaki alert late na ho
         if MOOD_ON:
