@@ -40,6 +40,7 @@ MOOD_TIMES     = ["09:21", "11:30", "13:30"]   # IST me kab-kab market mood bhej
 LIVE_ON        = True        # live price se khud candle banao (Angel ka candle data late aaye toh bhi alert turant)
 POLL_SEC       = 5           # live price har kitne second me lein
 HIST_REFRESH_MIN = 10        # Angel ki candle history har kitne min me dobara lein (beech me live candles)
+COMMANDS_ON    = True        # Telegram pe /FMCG, /IT, /BANK ... likhne pe us sector ke F&O shares ki list
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
 MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
@@ -1312,6 +1313,171 @@ def market_mood(api, now):
         tg("\n".join(lines), as_html=True)
 
 
+# ----------------------------- TELEGRAM COMMANDS (/FMCG, /IT ...) -----------------------------
+NSE_IDX_URL = "https://www.niftyindices.com/IndexConstituent/"
+SECTORS = {   # command: (naam, NSE index file, backup list)
+    "IT": ("IT", "ind_niftyitlist.csv", ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "LTIM", "PERSISTENT", "COFORGE",
+                                         "MPHASIS", "OFSS", "KPITTECH", "TATAELXSI", "LTTS", "TATATECH"]),
+    "BANK": ("BANK", "ind_niftybanklist.csv", ["HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "AXISBANK", "INDUSINDBK",
+                                               "BANKBARODA", "PNB", "CANBK", "AUBANK", "FEDERALBNK", "IDFCFIRSTB",
+                                               "BANDHANBNK", "UNIONBANK", "INDIANB", "YESBANK", "BANKINDIA", "RBLBANK"]),
+    "PSUBANK": ("PSU BANK", "ind_niftypsubanklist.csv", ["SBIN", "BANKBARODA", "PNB", "CANBK", "UNIONBANK", "INDIANB",
+                                                         "BANKINDIA"]),
+    "PVTBANK": ("PVT BANK", "ind_nifty_privatebanklist.csv", ["HDFCBANK", "ICICIBANK", "KOTAKBANK", "AXISBANK",
+                                                              "INDUSINDBK", "FEDERALBNK", "IDFCFIRSTB", "BANDHANBNK",
+                                                              "RBLBANK", "YESBANK"]),
+    "FIN": ("FIN SERVICE", "ind_niftyfinancelist.csv", ["BAJFINANCE", "BAJAJFINSV", "SHRIRAMFIN", "CHOLAFIN", "HDFCLIFE",
+                                                        "SBILIFE", "ICICIPRULI", "ICICIGI", "MUTHOOTFIN", "PFC",
+                                                        "RECLTD", "LICHSGFIN", "JIOFIN", "SBICARD", "BSE", "MCX",
+                                                        "CDSL", "ANGELONE", "HDFCAMC", "IRFC", "LICI", "MANAPPURAM"]),
+    "AUTO": ("AUTO", "ind_niftyautolist.csv", ["MARUTI", "M&M", "TMPV", "TMCV", "BAJAJ-AUTO", "EICHERMOT", "HEROMOTOCO",
+                                               "TVSMOTOR", "ASHOKLEY", "BHARATFORG", "BOSCHLTD", "MOTHERSON",
+                                               "EXIDEIND", "SONACOMS", "TIINDIA", "MRF", "BALKRISIND", "APOLLOTYRE"]),
+    "PHARMA": ("PHARMA", "ind_niftypharmalist.csv", ["SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB", "LUPIN", "AUROPHARMA",
+                                                     "ZYDUSLIFE", "TORNTPHARM", "ALKEM", "GLENMARK", "BIOCON",
+                                                     "MANKIND", "LAURUSLABS", "IPCALAB", "GRANULES"]),
+    "HEALTH": ("HEALTHCARE", "ind_niftyhealthcarelist.csv", ["APOLLOHOSP", "MAXHEALTH", "FORTIS", "SUNPHARMA", "DRREDDY",
+                                                             "CIPLA", "DIVISLAB", "LUPIN", "SYNGENE", "LALPATHLAB"]),
+    "FMCG": ("FMCG", "ind_niftyfmcglist.csv", ["HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "TATACONSUM", "DABUR",
+                                               "GODREJCP", "MARICO", "COLPAL", "UBL", "VBL", "UNITDSPR", "PATANJALI"]),
+    "METAL": ("METAL", "ind_niftymetallist.csv", ["TATASTEEL", "JSWSTEEL", "HINDALCO", "VEDL", "SAIL", "NMDC",
+                                                  "JINDALSTEL", "NATIONALUM", "HINDZINC", "COALINDIA", "APLAPOLLO",
+                                                  "HINDCOPPER"]),
+    "REALTY": ("REALTY", "ind_niftyrealtylist.csv", ["DLF", "LODHA", "GODREJPROP", "OBEROIRLTY", "PRESTIGE",
+                                                     "PHOENIXLTD", "BRIGADE", "SOBHA"]),
+    "ENERGY": ("ENERGY", "ind_niftyenergylist.csv", ["RELIANCE", "ONGC", "NTPC", "POWERGRID", "BPCL", "IOC", "HINDPETRO",
+                                                     "GAIL", "TATAPOWER", "ADANIGREEN", "ADANIENSOL", "NHPC",
+                                                     "JSWENERGY", "PETRONET", "OIL", "COALINDIA"]),
+    "OILGAS": ("OIL & GAS", "ind_niftyoilgaslist.csv", ["RELIANCE", "ONGC", "BPCL", "IOC", "HINDPETRO", "GAIL",
+                                                        "PETRONET", "OIL", "IGL", "MGL"]),
+    "MEDIA": ("MEDIA", "ind_niftymedialist.csv", ["ZEEL", "SUNTV", "PVRINOX", "NAZARA"]),
+    "CONSUMER": ("CONSUMER DURABLES", "ind_niftyconsumerdurableslist.csv",
+                 ["TITAN", "HAVELLS", "VOLTAS", "DIXON", "BLUESTARCO", "CROMPTON", "KALYANKJIL", "AMBER", "PGEL"]),
+}
+CMD_ALIAS = {"BANKNIFTY": "BANK", "PSU": "PSUBANK", "PRIVATEBANK": "PVTBANK", "FINANCE": "FIN", "FINSERV": "FIN",
+             "FINNIFTY": "FIN", "HEALTHCARE": "HEALTH", "OIL": "OILGAS", "GAS": "OILGAS", "PHARMACY": "PHARMA",
+             "CONSUMERDURABLES": "CONSUMER", "REAL": "REALTY", "STEEL": "METAL", "SECTOR": "SECTORS",
+             "MOOD": "SECTORS", "START": "HELP"}
+SECTOR_CACHE = {}
+FNO_SET = None
+EQ_TOKEN = None
+TG_OFFSET = None
+
+
+def fno_and_tokens():
+    global FNO_SET, EQ_TOKEN
+    if FNO_SET is None:
+        data = SCRIP_DATA or []
+        FNO_SET = {str(r.get("name", "")).upper() for r in data
+                   if r.get("exch_seg") == "NFO" and r.get("instrumenttype") == "FUTSTK"}
+        EQ_TOKEN = {r["symbol"][:-3].upper(): str(r["token"]) for r in data
+                    if r.get("exch_seg") == "NSE" and str(r.get("symbol", "")).endswith("-EQ")}
+    return FNO_SET, EQ_TOKEN
+
+
+def sector_members(key):
+    if key in SECTOR_CACHE:
+        return SECTOR_CACHE[key]
+    name, fname, backup = SECTORS[key]
+    syms = []
+    try:
+        r = requests.get(NSE_IDX_URL + fname, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        lines = r.text.strip().splitlines()
+        head = [h.strip().lower() for h in lines[0].split(",")]
+        si = head.index("symbol")
+        syms = [ln.split(",")[si].strip().upper() for ln in lines[1:] if ln.count(",") >= si]
+    except Exception as e:
+        print("Sector list download nahi hua", key, e)
+    if len(syms) < 3:
+        syms = backup
+    syms = list(dict.fromkeys(syms + [b for b in backup if b not in syms]))
+    SECTOR_CACHE[key] = syms
+    return syms
+
+
+def sector_reply(api, key):
+    name = SECTORS[key][0]
+    fno, eq = fno_and_tokens()
+    syms = [x for x in sector_members(key) if (not fno or x in fno) and x in eq]
+    if not syms:
+        return f"🏭 {name}: F&O shares nahi mile."
+    toks = [eq[x] for x in syms]
+    inv = {eq[x]: x for x in syms}
+    rows = []
+    for i in range(0, len(toks), 50):
+        res = api.getMarketData("FULL", {"NSE": toks[i:i + 50]})
+        for d in ((res or {}).get("data") or {}).get("fetched") or []:
+            sym = inv.get(str(d.get("symbolToken")))
+            if sym and d.get("percentChange") is not None:
+                rows.append((sym, float(d["percentChange"]), float(d.get("ltp") or 0)))
+    if not rows:
+        return f"🏭 {name}: abhi data nahi mila, thodi der baad try karo."
+    rows.sort(key=lambda x: x[1], reverse=True)
+    now = datetime.now(IST)
+    up = sum(1 for r in rows if r[1] > 0)
+    dn = sum(1 for r in rows if r[1] < 0)
+    avg_pc = sum(r[1] for r in rows) / len(rows)
+    lines = [f"🏭 <b>{html.escape(name)}</b> — F&amp;O shares ({now:%H:%M} IST)", ""]
+    for sym, pc, ltp in rows:
+        lines.append(f"{'🟢' if pc > 0 else '🔴' if pc < 0 else '⚪'} <code>{html.escape(sym)}</code>  "
+                     f"<b>{pc:+.2f}%</b>  ₹{ltp:,.2f}")
+    lines += ["", f"📊 {up} 🟢 / {dn} 🔴  •  Average {avg_pc:+.2f}%",
+              f"💪 Sabse strong: {html.escape(rows[0][0])}  •  🥵 Sabse weak: {html.escape(rows[-1][0])}"]
+    return "\n".join(lines)
+
+
+def help_text():
+    cmds = "  ".join("/" + k for k in SECTORS)
+    return ("🤖 <b>Commands</b>\n\nSector ke F&amp;O shares % ke hisaab se:\n" + cmds +
+            "\n\n/SECTORS — saare sectors ka mood\n/HELP — yeh list\n\n"
+            "<i>Bot sirf market time me jawab deta hai (scanner chalu hone par).</i>")
+
+
+def setup_commands():
+    """Telegram me '/' dabane pe commands ki list dikhe, aur purane messages ignore ho."""
+    global TG_OFFSET
+    try:
+        cmds = [{"command": k.lower(), "description": f"{SECTORS[k][0]} F&O shares % wise"} for k in SECTORS]
+        cmds += [{"command": "sectors", "description": "Saare sectors ka mood"},
+                 {"command": "help", "description": "Commands list"}]
+        requests.post(f"{TG_URL}/setMyCommands", data={"commands": json.dumps(cmds)}, timeout=15)
+        r = requests.get(f"{TG_URL}/getUpdates", params={"offset": -1, "timeout": 0}, timeout=15).json()
+        res = r.get("result") or []
+        TG_OFFSET = res[-1]["update_id"] + 1 if res else None
+    except Exception as e:
+        print("Command setup error:", e)
+
+
+def handle_commands(api):
+    global TG_OFFSET
+    params = {"timeout": 0}
+    if TG_OFFSET is not None:
+        params["offset"] = TG_OFFSET
+    r = requests.get(f"{TG_URL}/getUpdates", params=params, timeout=10).json()
+    for u in r.get("result") or []:
+        TG_OFFSET = u["update_id"] + 1
+        m = u.get("message") or {}
+        if str((m.get("chat") or {}).get("id")) != TG_CHAT:
+            continue                                   # sirf aapki chat ke commands
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+        cmd = text.lstrip("/").split("@")[0].split()[0].upper().replace(" ", "").replace("&", "")
+        cmd = CMD_ALIAS.get(cmd, cmd)
+        try:
+            if cmd in SECTORS:
+                tg(sector_reply(api, cmd), as_html=True)
+            elif cmd == "SECTORS":
+                market_mood(api, datetime.now(IST))
+            elif cmd == "HELP":
+                tg(help_text(), as_html=True)
+            elif text.startswith("/"):
+                tg("❓ Yeh command nahi pata. /HELP likh ke list dekho.")
+        except Exception as e:
+            print("Command error", cmd, e)
+            tg(f"⚠️ {cmd} ka data abhi nahi mila, thodi der baad try karo.")
+
+
 def build_watch(api, tokens, title):
     g, l = movers(api, tokens)
     watch = [s for s in FIXED if s in tokens] + [x[0] for x in g] + [x[0] for x in l]
@@ -1352,6 +1518,8 @@ def main():
     tg(msg, as_html=True)
     if NEWS_ON and RUN_START.hour < 10:
         premarket_news(RUN_START)
+    if COMMANDS_ON:
+        setup_commands()
     last_refresh = datetime.now(IST)
     traded_today = False
     err_count, last_err, last_err_alert = 0, "", 0.0
@@ -1367,6 +1535,11 @@ def main():
         wait = (1 - now.second) % POLL_SEC or POLL_SEC
         time.sleep(max(0.5, wait - now.microsecond / 1e6))
         now = datetime.now(IST)
+        if COMMANDS_ON:
+            try:
+                handle_commands(api)
+            except Exception as e:
+                print("Command poll error:", e)
         if now < mopen:
             continue
 
