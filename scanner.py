@@ -13,15 +13,16 @@ sys.stdout.reconfigure(line_buffering=True)   # logs turant GitHub pe dikhen
 
 # ================= SETTINGS (sirf yahan badlav karein) =================
 FIXED       = ["LODHA"]      # ye shares hamesha scan honge
-TOP_N       = 5              # kitne top gainers aur kitne top losers
-TIMEFRAMES  = [5]            # minutes me: 1, 3, 5, 10, 15, 30
+TOP_N       = 3              # kitne top gainers aur kitne top losers (1m pe bheed kam)
+TIMEFRAMES  = [1]            # minutes me: 1, 3, 5, 10, 15, 30  (1 = scalping)
 FAST, SLOW  = 9, 21          # EMA periods
 RR          = 2              # Target 2 = risk x 2  (1:2); Target 1 = 1:1
-MIN_RISK_PCT = 0.15          # SL kam se kam itna % door
-MAX_RISK_PCT = 0.5           # SL zyada se zyada itna % door (target realistic rahe)
+MIN_RISK_PCT = 0.08          # SL kam se kam itna % door
+MAX_RISK_PCT = 0.30          # SL zyada se zyada itna % door
 REFRESH_MIN = 30             # gainers/losers list har kitne minute me update ho
 BIG_EMOJI   = True           # alert se pehle bada 🚀 / 🔻 emoji
-MAX_LATE    = 1              # candle band hone ke 1 min ke andar hi alert; isse late = skip
+MAX_LATE    = 2              # signal hamesha banega; sirf 2 min se purana (stale) skip — normal delay 2-5 sec
+LATE_WARN_SEC = 10           # isse zyada der ho toh alert me warning
 STRATEGY_EMA      = True     # EMA 9/21 crossover signals
 STRATEGY_REVERSAL = True     # Reversal (bottom/top) signals
 RSI_LOW, RSI_HIGH = 40, 60   # reversal ke liye RSI kitna neeche/upar gaya ho (30/70 = kam par strong signal)
@@ -29,10 +30,11 @@ REV_WITH_TREND = True        # True = sirf trend (EMA200) ki direction me revers
 EXHAUST_ON = True            # trend ke ulta bhi reversal do agar giraawat/chadhaav 'exhaust' ho gaya ho (V-reversal)
 EXHAUST_RSI_LOW, EXHAUST_RSI_HIGH = 30, 70   # exhaustion ke liye RSI kitna extreme gaya ho
 EXHAUST_STRETCH_ATR = 1.5    # price EMA21 se kam se kam itne ATR door gaya ho
-MAX_EXHAUST_RISK_PCT = 1.3   # V-reversal me candles badi hoti hain, isliye SL thoda door allowed
-WHIPSAW_MIN = 30             # usi share pe itne min me ulta EMA crossover hua ho toh naya EMA signal skip
-SL_COOLDOWN_MIN = 45         # kisi share pe SL lage toh itne min tak us share pe naya signal nahi
-MAX_SIGNALS_PER_STOCK = 3    # ek share pe din me zyada se zyada itne naye signals
+MAX_EXHAUST_RISK_PCT = 0.6   # V-reversal me candles badi hoti hain, isliye SL thoda door allowed
+WHIPSAW_MIN = 10             # usi share pe itne min me ulta EMA crossover hua ho toh naya EMA signal skip
+SL_COOLDOWN_MIN = 15         # kisi share pe SL lage toh itne min tak us share pe naya signal nahi
+MAX_SIGNALS_PER_STOCK = 4    # ek share pe din me zyada se zyada itne naye signals
+MIN_STARS   = 3              # sirf itne ya zyada ⭐ wale signals bhejo (1m pe noise kam)
 NEWS_ON        = True        # watchlist shares ki news Telegram pe
 NEWS_EVERY_MIN = 20          # har kitne minute me news check ho
 MOOD_ON        = True        # market mood + sectoral movement
@@ -47,7 +49,7 @@ REPORT_AT      = "15:20"     # IST — din ka poora report
 PART1_STOP     = "14:40"     # IST — part 1 yahan rukta hai, part 2 market close tak (GitHub 6 ghante limit)
 RUN_PART       = os.environ.get("RUN_PART", "")   # workflow se "1" ya "2"
 REV_LOOKBACK = 6             # pichhli kitni candles me RSI oversold/overbought dekha jaye
-MAX_REV_RISK_PCT = 0.8       # reversal ka SL (swing low/high) isse door ho toh signal skip
+MAX_REV_RISK_PCT = 0.4       # reversal ka SL (swing low/high) isse door ho toh signal skip
 TRADE_FROM, TRADE_TILL = "09:25", "15:00"   # sirf is time ke beech naye signals
 STRATEGY_SMC      = False    # Smart Money Concepts (sweep + CHoCH + FVG/OB) signals
 SMC_FROM, SMC_TILL = "09:30", "14:45"       # SMC plans sirf is time me
@@ -684,12 +686,17 @@ def send_reversal(sym, tf, c, f, s, rs, bull, trades, ltp, now, exhaust=False):
     elif not bull and vw < cl:
         notes.append(f"🎯 VWAP {vw:.2f} neeche hai — wahan support aa sakta hai")
     star_txt = "⭐" * stars + "☆" * (4 - stars)
+    if stars < MIN_STARS:
+        SIG_COUNT[sym] = max(0, SIG_COUNT.get(sym, 1) - 1)
+        print(f"Skip REV {side} {sym} {t:%H:%M}: sirf {stars}⭐")
+        return
 
     close_time = t + timedelta(minutes=tf)
-    late = int((now - close_time).total_seconds() // 60)
-    timing = f"⏱ Candle close {close_time:%H:%M} | Alert {now:%H:%M}"
-    if late >= 3:
-        timing += f"\n⚠️ Data {late} min late aaya — abhi price {ltp:.2f}"
+    now = datetime.now(IST)
+    late_s = max(0, int((now - close_time).total_seconds()))
+    timing = f"⏱ Candle close {close_time:%H:%M:%S} | Alert {now:%H:%M:%S} ({late_s} sec)"
+    if late_s > LATE_WARN_SEC:
+        timing += f"\n⚠️ {late_s} sec late — entry se pehle price check karo (abhi {ltp:.2f})"
     pct = lambda a: abs(a - cl) / cl * 100
     if exhaust:
         notes.insert(0, "⚡ <b>Exhaustion reversal</b> — trend ke ulta, tez giraawat/chadhaav ke baad palta")
@@ -766,12 +773,17 @@ def send_signal(sym, tf, c, f, s, bull, trades, ltp, now):
     else:
         notes.append(f"ℹ️ RSI {r:.0f}")
     star_txt = "⭐" * stars + "☆" * (4 - stars)
+    if stars < MIN_STARS:
+        SIG_COUNT[sym] = max(0, SIG_COUNT.get(sym, 1) - 1)
+        print(f"Skip EMA {side} {sym} {t:%H:%M}: sirf {stars}⭐")
+        return
 
     close_time = t + timedelta(minutes=tf)
-    late = int((now - close_time).total_seconds() // 60)
-    timing = f"⏱ Candle close {close_time:%H:%M} | Alert {now:%H:%M}"
-    if late >= 3:
-        timing += f"\n⚠️ Data {late} min late aaya — abhi price {ltp:.2f}"
+    now = datetime.now(IST)
+    late_s = max(0, int((now - close_time).total_seconds()))
+    timing = f"⏱ Candle close {close_time:%H:%M:%S} | Alert {now:%H:%M:%S} ({late_s} sec)"
+    if late_s > LATE_WARN_SEC:
+        timing += f"\n⚠️ {late_s} sec late — entry se pehle price check karo (abhi {ltp:.2f})"
 
     pct = lambda a: abs(a - cl) / cl * 100
     level_note = ""
