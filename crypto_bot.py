@@ -9,18 +9,21 @@ LOOKBACK = 60
 IMPULSE = 1.2   # impulse body >= 1.2 x ATR
 ADX_MIN = 20    # 1m pe isse neeche = sideways, alert band
 
+OKX_IDS = {"BTCUSDT": "BTC-USDT-SWAP", "XAUUSDT": "XAU-USDT-SWAP"}
+
 def get_candles(sym, tf, sec):
     r = requests.get(
-        "https://api.bybit.com/v5/market/kline",
-        params={"category": "linear", "symbol": sym,
-                "interval": tf, "limit": 300},
+        "https://www.okx.com/api/v5/market/candles",
+        params={"instId": OKX_IDS[sym], "bar": tf + "m", "limit": 300},
         timeout=15)
     r.raise_for_status()
-    rows = r.json()["result"]["list"][::-1]
-    c = [{"t": int(x[0]) // 1000, "o": float(x[1]), "h": float(x[2]),
-          "l": float(x[3]), "c": float(x[4])} for x in rows]
-    now = time.time()
-    return [x for x in c if x["t"] + sec <= now]  # sirf closed candles
+    j = r.json()
+    if j.get("code") != "0":
+        raise Exception("OKX: " + str(j.get("msg")))
+    rows = j["data"][::-1]  # purani se nayi
+    return [{"t": int(x[0]) // 1000, "o": float(x[1]), "h": float(x[2]),
+             "l": float(x[3]), "c": float(x[4])}
+            for x in rows if x[8] == "1"]  # sirf closed candles
 
 def ema(vals, n):
     k = 2 / (n + 1)
