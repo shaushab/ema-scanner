@@ -152,12 +152,19 @@ def find_cross(c):
     return out
 
 def send(text):
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT, "text": text}, timeout=15)
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT, "text": text}, timeout=15)
+        if r.status_code != 200:
+            print("Telegram error:", r.status_code, r.text, flush=True)
+    except Exception as ex:
+        print("Telegram error:", ex, flush=True)
 
 def main():
     start = time.time()
+    print("bot started", flush=True)
+    send("✅ Crypto bot chalu hai: BTC + Gold (1m, 15m)")
     seen = {}
     while time.time() - start < RUN_SECONDS:
         for sym in SYMBOLS:
