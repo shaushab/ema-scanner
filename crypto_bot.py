@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 CHAT = os.environ["TELEGRAM_CHAT_ID"].strip()
 NTFY = os.environ.get("NTFY_TOPIC", "").strip()
+WA_PHONE = os.environ.get("WA_PHONE", "").strip()    # jaise +971501234567
+WA_APIKEY = os.environ.get("WA_APIKEY", "").strip()  # CallMeBot se mili key
 SYMBOLS = ["BTCUSDT", "XAUUSDT"]
 TFS = {"15": 900, "5": 300, "1": 60}  # interval -> seconds (15m pehle, trend ke liye)
 RUN_SECONDS = 5 * 3600 + 45 * 60
@@ -252,36 +254,112 @@ def _ntfy_worker():
 if NTFY:
     threading.Thread(target=_ntfy_worker, daemon=True).start()
 
-def send(text):
+_wq = queue.Queue()
+
+def _wa_worker():
+    # CallMeBot (free WhatsApp API) - sirf zaroori alerts, dheere dheere
+    while True:
+        text = _wq.get()
+        try:
+            for attempt in range(1, 4):
+                try:
+                    r = requests.get("https://api.callmebot.com/whatsapp.php",
+                                     params={"phone": WA_PHONE, "text": text,
+                                             "apikey": WA_APIKEY},
+                                     timeout=30)
+                    if r.status_code == 200:
+                        print("WhatsApp OK", flush=True)
+                        break
+                    print("WhatsApp error:", r.status_code, r.text[:200], flush=True)
+                except Exception as ex:
+                    print("WhatsApp error (try", attempt, "):", ex, flush=True)
+                time.sleep(10 * attempt)
+        finally:
+            time.sleep(8)  # free API: messages ke beech gap
+            _wq.task_done()
+
+if WA_PHONE and WA_APIKEY:
+    threading.Thread(target=_wa_worker, daemon=True).start()
+
+def send(text, wa=False):
     _q.put(text)  # main loop block nahi hota, alert background me jata hai
     if NTFY:
         _nq.put(text)
+    if wa and WA_PHONE and WA_APIKEY:  # WhatsApp pe sirf zaroori alerts
+        _wq.put(text)
+
+def get_candles_long(sym, tf, pages=3):
+    # status ke liye zyada history (3 x 300 candles), EMA 200 sahi bane
+    out, after = [], None
+    for _ in range(pages):
+        params = {"instId": OKX_IDS[sym], "bar": tf + "m", "limit": 300}
+        if after:
+            params["after"] = after
+        r = requests.get("https://www.okx.com/api/v5/market/candles",
+                         params=params, timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        if j.get("code") != "0" or not j["data"]:
+            break
+        out += j["data"]
+        after = j["data"][-1][0]  # sabse purani candle ka time
+    rows = sorted({x[0]: x for x in out}.values(), key=lambda x: int(x[0]))
+    return [{"t": int(x[0]) // 1000, "o": float(x[1]), "h": float(x[2]),
+             "l": float(x[3]), "c": float(x[4])}
+            for x in rows if x[8] == "1"]
+
+def last_cross(c, a, b, start):
+    for i in range(len(c) - 1, start, -1):
+        if (a[i - 1] <= b[i - 1]) != (a[i] <= b[i]):
+            side = "BUY" if a[i] > b[i] else "SELL"
+            hrs = (c[-1]["t"] - c[i]["t"]) / 3600
+            return f"{side}, {hrs:.1f} ghante pehle" if hrs < 48 else f"{side}, {hrs / 24:.1f} din pehle"
+    days = (c[-1]["t"] - c[start]["t"]) / 86400
+    return f"pichle ~{days:.0f} din me nahi"
 
 def status_15m():
-    # bot start hone pe 15m ka haal: trend + last cross kab hua
+    # bot start hone pe 15m ka haal: trend, EMA 200, last cross kab hua
     lines = ["📊 15m status"]
     for sym in SYMBOLS:
         try:
-            c = get_candles(sym, "15", 900)
+            try:
+                c = get_candles_long(sym, "15")
+            except Exception:
+                c = get_candles(sym, "15", 900)
             closes = [x["c"] for x in c]
             e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
-            if e50[-1] > e200[-1] and closes[-1] > e50[-1]:
+            px = closes[-1]
+            if e50[-1] > e200[-1] and px > e50[-1]:
                 trend = "Bullish"
-            elif e50[-1] < e200[-1] and closes[-1] < e50[-1]:
+            elif e50[-1] < e200[-1] and px < e50[-1]:
                 trend = "Bearish"
             else:
                 trend = "Mixed"
-            last = "pichle ~60 ghante me nahi"
-            for i in range(len(c) - 1, 60, -1):
-                if (e20[i - 1] <= e50[i - 1]) != (e20[i] <= e50[i]):
-                    side = "BUY" if e20[i] > e50[i] else "SELL"
-                    hrs = (c[-1]["t"] - c[i]["t"]) / 3600
-                    last = f"{side}, {hrs:.1f} ghante pehle"
-                    break
-            lines.append(f"{sym}: {trend} | last 20/50 cross: {last}")
+            dist = (px - e200[-1]) / e200[-1] * 100
+            pos = "UPAR ⬆️" if px > e200[-1] else "NEECHE ⬇️"
+            start = min(200, len(c) - 2)  # EMA 200 warm-up ke baad hi cross gino
+            lines.append(
+                f"\n{sym}: {trend} | Price {px:.2f}\n"
+                f"EMA 20: {e20[-1]:.2f} | EMA 50: {e50[-1]:.2f} | EMA 200: {e200[-1]:.2f}\n"
+                f"Price EMA 200 se {pos} ({dist:+.2f}%)\n"
+                f"Last 20/50 cross: {last_cross(c, e20, e50, 60)}\n"
+                f"Last 50/200 cross: {last_cross(c, e50, e200, start)}\n"
+                f"Last price/EMA 200 cross: {last_cross(c, closes, e200, start)}")
         except Exception as ex:
             lines.append(f"{sym}: error {ex}")
     return "\n".join(lines)
+
+def ema200_break(c):
+    # 15m candle EMA 200 ke aar-paar close hui?
+    if len(c) < 210:
+        return None
+    closes = [x["c"] for x in c]
+    e200 = ema(closes, 200)
+    if closes[-2] <= e200[-2] and closes[-1] > e200[-1]:
+        return "UPAR", e200[-1]
+    if closes[-2] >= e200[-2] and closes[-1] < e200[-1]:
+        return "NEECHE", e200[-1]
+    return None
 
 # ---------- trade tracking + daily summary ----------
 def load_state():
@@ -328,7 +406,7 @@ def summary_text(day, stats):
 def check_day(st):
     today = datetime.now(DXB).strftime("%Y-%m-%d")
     if today != st["day"]:
-        send(summary_text(st["day"], st["stats"]))
+        send(summary_text(st["day"], st["stats"]), wa=True)
         st["day"], st["stats"] = today, {}
         save_state(st)
 
@@ -363,9 +441,9 @@ def track(st, sym, c1):
             if (x["l"] <= t["sl"]) if buy else (x["h"] >= t["sl"]):
                 if t["hit"] == 0:
                     bump(st, key, "sl")
-                    send(f"🛑 SL hit: {head}")
+                    send(f"🛑 SL hit: {head}", wa=True)
                 else:
-                    send(f"↩️ TP{t['hit']} ke baad SL hit: {head}")
+                    send(f"↩️ TP{t['hit']} ke baad SL hit: {head}", wa=True)
                 alive = False
                 break
             for n in range(t["hit"] + 1, 4):
@@ -373,7 +451,7 @@ def track(st, sym, c1):
                 if (x["h"] >= tp) if buy else (x["l"] <= tp):
                     t["hit"] = n
                     bump(st, key, f"tp{n}")
-                    send(f"✅ TP{n} hit: {head} → {tp:.2f}")
+                    send(f"✅ TP{n} hit: {head} → {tp:.2f}", wa=True)
             if t["hit"] == 3:
                 alive = False
                 break
@@ -448,7 +526,8 @@ def main():
     print("bot started", flush=True)
     st = load_state()
     send("✅ Crypto bot chalu hai: BTC + Gold (1m, 5m, 15m)\n\n"
-         + status_15m() + "\n\n" + sessions_text())
+         + status_15m() + "\n\n" + sessions_text()
+         + ("\n\nWhatsApp: ON" if WA_PHONE and WA_APIKEY else "\n\nWhatsApp: OFF (secrets nahi mile)"))
     seen = {}
     htf = {}  # sym -> 15m trend "BUY"/"SELL"
     last_save = time.time()
@@ -466,6 +545,11 @@ def main():
                         continue
                     seen[key] = c[-1]["t"]
                     if tf == "15":
+                        br = ema200_break(c)
+                        if br:
+                            send(f"⚡ {sym} (15m): price EMA 200 ke {br[0]} close hua\n"
+                                 f"Close: {c[-1]['c']:.2f} | EMA 200: {br[1]:.2f}\n"
+                                 f"{'Trend bullish ho sakta hai' if br[0] == 'UPAR' else 'Trend bearish ho sakta hai'}", wa=True)
                         cl = [x["c"] for x in c]
                         htf[sym] = "BUY" if ema(cl, 20)[-1] > ema(cl, 50)[-1] else "SELL"
                     sigs = []
@@ -493,7 +577,7 @@ def main():
                             msg += "\n" + extra
                         if tf in ("1", "5") and HTF_FILTER:
                             msg += f"\n15m trend: {side} ✔"
-                        send(msg)
+                        send(msg, wa=True)
                         limit = kind == "OB Retest"
                         st["trades"].append({
                             "sym": sym, "tf": tf, "side": side, "entry": e,
@@ -513,5 +597,5 @@ def main():
 
 main()
 end = time.time() + 180
-while (_q.unfinished_tasks or _nq.unfinished_tasks) and time.time() < end:
+while (_q.unfinished_tasks or _nq.unfinished_tasks or _wq.unfinished_tasks) and time.time() < end:
     time.sleep(1)
