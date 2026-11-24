@@ -1,14 +1,29 @@
-import os, time, threading, queue, requests
+import os, time, json, threading, queue, requests
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 CHAT = os.environ["TELEGRAM_CHAT_ID"].strip()
 NTFY = os.environ.get("NTFY_TOPIC", "").strip()
 SYMBOLS = ["BTCUSDT", "XAUUSDT"]
-TFS = {"1": 60, "15": 900}  # interval -> seconds
+TFS = {"15": 900, "5": 300, "1": 60}  # interval -> seconds (15m pehle, trend ke liye)
 RUN_SECONDS = 5 * 3600 + 45 * 60
-LOOKBACK = 60
+LOOKBACK = {"1": 60, "5": 80, "15": 100}  # kitni purani candles tak OB dhoondhe
 IMPULSE = 1.2   # impulse body >= 1.2 x ATR
-ADX_MIN = 20    # 1m pe isse neeche = sideways, alert band
+SL_BUF = 0.3    # SL = zone ke bahar 0.3 x ATR
+PUSH_MAX = 1.5  # pichli 3 candles ka ulta push > 1.5 x ATR ho to OB signal skip
+ADX_MIN = 20    # 1m/5m pe isse neeche = sideways, alert band
+HTF_FILTER = True      # 1m/5m signal sirf 15m trend ki side me
+SESSION_FILTER = True  # 1m/5m alerts sirf London/NY session me
+SESSION_ALERTS = True  # session shuru/band hone pe alert
+# (naam, city timezone, open hour, close hour) - local time, DST khud adjust
+SESSIONS = [("Tokyo", "Asia/Tokyo", 9, 18),
+            ("London", "Europe/London", 8, 17),
+            ("New York", "America/New_York", 8, 17)]
+SESS_FLAG = {"Tokyo": "🇯🇵", "London": "🇬🇧", "New York": "🇺🇸"}
+LIMIT_EXPIRE = 10      # limit entry itni candles me fill na ho to cancel
+STATE_FILE = "crypto_state.json"
+DXB = timezone(timedelta(hours=4))
 
 OKX_IDS = {"BTCUSDT": "BTC-USDT-SWAP", "XAUUSDT": "XAU-USDT-SWAP"}
 
@@ -74,19 +89,26 @@ def adx_last(c, n=14):
         a = (a * (n - 1) + d) / n
     return a
 
-def find_ob(c):
+def find_ob(c, tf="1"):
     n = len(c)
     if n < 210:
         return None
     closes = [x["c"] for x in c]
     e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
     atr = atr_list(c)
+    a = atr[-1]
     last = c[-1]
-    bull = e20[-1] > e50[-1] > e200[-1] and last["c"] > e50[-1]
-    bear = e20[-1] < e50[-1] < e200[-1] and last["c"] < e50[-1]
+    if tf in ("1", "5"):
+        bull = e20[-1] > e50[-1] > e200[-1] and last["c"] > e50[-1]
+        bear = e20[-1] < e50[-1] < e200[-1] and last["c"] < e50[-1]
+    else:  # 15m: thoda relax, sirf EMA 50 vs 200
+        bull = e50[-1] > e200[-1] and last["c"] > e50[-1]
+        bear = e50[-1] < e200[-1] and last["c"] < e50[-1]
     if not (bull or bear):
         return None
-    for i in range(n - 3, n - LOOKBACK, -1):
+    # pichli 3 candles (last se pehle) ka push
+    push = sum(x["c"] - x["o"] for x in c[-4:-1])
+    for i in range(n - 3, n - LOOKBACK[tf], -1):
         o = c[i]
         nx = c[i + 1]
         body = abs(nx["c"] - nx["o"])
@@ -96,31 +118,38 @@ def find_ob(c):
             lo, hi = o["l"], o["h"]
             if any(x["l"] <= hi for x in mid):
                 continue
-            if last["l"] <= hi and last["c"] > hi:
-                entry = last["c"]
-                sl = lo - 0.1 * atr[-1]
+            # rejection: wick zone me, green candle, close zone ke upar
+            if last["l"] <= hi and last["c"] > hi and last["c"] > last["o"]:
+                if push < -PUSH_MAX * a:  # neeche ka strong push, buy risky
+                    return None
+                entry = hi  # limit entry: zone top
+                sl = lo - SL_BUF * a
                 risk = entry - sl
                 if risk <= 0:
                     return None
                 return ("OB Retest", "BUY", entry, sl,
                         [entry + risk * m for m in (1, 2, 3)],
-                        f"OB zone: {lo:.2f} - {hi:.2f}")
+                        f"OB zone: {lo:.2f} - {hi:.2f}\n"
+                        f"Abhi price: {last['c']:.2f} (limit order zone top pe)")
         if bear and o["c"] > o["o"] and nx["c"] < o["l"] and strong:
             lo, hi = o["l"], o["h"]
             if any(x["h"] >= lo for x in mid):
                 continue
-            if last["h"] >= lo and last["c"] < lo:
-                entry = last["c"]
-                sl = hi + 0.1 * atr[-1]
+            if last["h"] >= lo and last["c"] < lo and last["c"] < last["o"]:
+                if push > PUSH_MAX * a:  # upar ka strong push, sell risky
+                    return None
+                entry = lo  # limit entry: zone bottom
+                sl = hi + SL_BUF * a
                 risk = sl - entry
                 if risk <= 0:
                     return None
                 return ("OB Retest", "SELL", entry, sl,
                         [entry - risk * m for m in (1, 2, 3)],
-                        f"OB zone: {lo:.2f} - {hi:.2f}")
+                        f"OB zone: {lo:.2f} - {hi:.2f}\n"
+                        f"Abhi price: {last['c']:.2f} (limit order zone bottom pe)")
     return None
 
-def find_cross(c):
+def find_cross(c, tf="1"):
     if len(c) < 210:
         return []
     closes = [x["c"] for x in c]
@@ -138,6 +167,12 @@ def find_cross(c):
         if not side:
             continue
         entry = c[-1]["c"]
+        # 1m/5m pe 20/50 cross sirf EMA 200 trend ki side me
+        if tf in ("1", "5") and name == "EMA 20/50 Cross":
+            if side == "BUY" and entry < e200[-1]:
+                continue
+            if side == "SELL" and entry > e200[-1]:
+                continue
         recent = c[-10:]
         if side == "BUY":
             sl = min(x["l"] for x in recent) - 0.1 * atr[-1]
@@ -222,41 +257,259 @@ def send(text):
     if NTFY:
         _nq.put(text)
 
+def status_15m():
+    # bot start hone pe 15m ka haal: trend + last cross kab hua
+    lines = ["📊 15m status"]
+    for sym in SYMBOLS:
+        try:
+            c = get_candles(sym, "15", 900)
+            closes = [x["c"] for x in c]
+            e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+            if e50[-1] > e200[-1] and closes[-1] > e50[-1]:
+                trend = "Bullish"
+            elif e50[-1] < e200[-1] and closes[-1] < e50[-1]:
+                trend = "Bearish"
+            else:
+                trend = "Mixed"
+            last = "pichle ~60 ghante me nahi"
+            for i in range(len(c) - 1, 60, -1):
+                if (e20[i - 1] <= e50[i - 1]) != (e20[i] <= e50[i]):
+                    side = "BUY" if e20[i] > e50[i] else "SELL"
+                    hrs = (c[-1]["t"] - c[i]["t"]) / 3600
+                    last = f"{side}, {hrs:.1f} ghante pehle"
+                    break
+            lines.append(f"{sym}: {trend} | last 20/50 cross: {last}")
+        except Exception as ex:
+            lines.append(f"{sym}: error {ex}")
+    return "\n".join(lines)
+
+# ---------- trade tracking + daily summary ----------
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    st.setdefault("trades", [])
+    st.setdefault("day", datetime.now(DXB).strftime("%Y-%m-%d"))
+    st.setdefault("stats", {})
+    return st
+
+def save_state(st):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(st, f, indent=1)
+    except Exception as ex:
+        print("state save error:", ex, flush=True)
+
+def bump(st, key, field):
+    d = st["stats"].setdefault(key, {"signals": 0, "filled": 0, "tp1": 0,
+                                     "tp2": 0, "tp3": 0, "sl": 0, "cancel": 0})
+    d[field] += 1
+
+def summary_text(day, stats):
+    if not stats:
+        return f"📅 Daily summary {day}\nKoi signal nahi aaya."
+    lines = [f"📅 Daily summary {day}"]
+    tot = {"signals": 0, "tp1": 0, "sl": 0}
+    for key in sorted(stats):
+        d = stats[key]
+        for k in tot:
+            tot[k] += d[k]
+        done = d["tp1"] + d["sl"]
+        wr = f"{100 * d['tp1'] / done:.0f}%" if done else "-"
+        lines.append(f"{key}: {d['signals']} signal | TP1 {d['tp1']} TP2 {d['tp2']} "
+                     f"TP3 {d['tp3']} | SL {d['sl']} | cancel {d['cancel']} | win {wr}")
+    done = tot["tp1"] + tot["sl"]
+    wr = f"{100 * tot['tp1'] / done:.0f}%" if done else "-"
+    lines.append(f"\nTotal: {tot['signals']} signal, win rate {wr} (TP1 pehle hit = win)")
+    return "\n".join(lines)
+
+def check_day(st):
+    today = datetime.now(DXB).strftime("%Y-%m-%d")
+    if today != st["day"]:
+        send(summary_text(st["day"], st["stats"]))
+        st["day"], st["stats"] = today, {}
+        save_state(st)
+
+def track(st, sym, c1):
+    # 1m candles se har open trade ka TP/SL check
+    keep = []
+    for t in st["trades"]:
+        if t["sym"] != sym:
+            keep.append(t)
+            continue
+        key = f"{sym} {t['tf']}m"
+        head = f"{sym} ({t['tf']}m) {t['side']} @ {t['entry']:.2f}"
+        buy = t["side"] == "BUY"
+        alive = True
+        for x in c1:
+            if x["t"] <= t["chk"]:
+                continue
+            t["chk"] = x["t"]
+            if not t["filled"]:
+                if (x["l"] <= t["entry"]) if buy else (x["h"] >= t["entry"]):
+                    t["filled"] = True
+                    bump(st, key, "filled")
+                    send(f"📥 Limit fill: {head}")
+                elif x["t"] > t["expire"]:
+                    bump(st, key, "cancel")
+                    send(f"⌛ Cancel (fill nahi hua): {head}")
+                    alive = False
+                    break
+                else:
+                    continue
+            # SL pehle check (ek hi candle me dono ho to SL maana)
+            if (x["l"] <= t["sl"]) if buy else (x["h"] >= t["sl"]):
+                if t["hit"] == 0:
+                    bump(st, key, "sl")
+                    send(f"🛑 SL hit: {head}")
+                else:
+                    send(f"↩️ TP{t['hit']} ke baad SL hit: {head}")
+                alive = False
+                break
+            for n in range(t["hit"] + 1, 4):
+                tp = t["tps"][n - 1]
+                if (x["h"] >= tp) if buy else (x["l"] <= tp):
+                    t["hit"] = n
+                    bump(st, key, f"tp{n}")
+                    send(f"✅ TP{n} hit: {head} → {tp:.2f}")
+            if t["hit"] == 3:
+                alive = False
+                break
+        if alive:
+            keep.append(t)
+    st["trades"] = keep
+
+def sess_times(tzname, oh, ch, now):
+    # aaj ka open/close (session city ke time me), Dubai time me convert
+    loc = now.astimezone(ZoneInfo(tzname))
+    op = loc.replace(hour=oh, minute=0, second=0, microsecond=0)
+    cl = loc.replace(hour=ch, minute=0, second=0, microsecond=0)
+    return op, cl
+
+def active_sessions(now=None):
+    now = now or datetime.now(timezone.utc)
+    act = []
+    for name, tz, oh, ch in SESSIONS:
+        op, cl = sess_times(tz, oh, ch, now)
+        if op.weekday() < 5 and op <= now < cl:
+            act.append(name)
+    return act
+
+def in_session():
+    a = active_sessions()
+    return "London" in a or "New York" in a
+
+def dxb(t):
+    return t.astimezone(DXB).strftime("%I:%M %p").lstrip("0")
+
+def sessions_text():
+    now = datetime.now(timezone.utc)
+    lines = ["🕒 Sessions (Dubai time)"]
+    for name, tz, oh, ch in SESSIONS:
+        op, cl = sess_times(tz, oh, ch, now)
+        on = "🟢 chalu" if name in active_sessions(now) else "⚪ band"
+        lines.append(f"{SESS_FLAG[name]} {name}: {dxb(op)} - {dxb(cl)}  {on}")
+    if now.astimezone(DXB).weekday() >= 5:
+        lines.append("Weekend: forex sessions band (crypto chalu)")
+    return "\n".join(lines)
+
+def session_alerts(st):
+    if not SESSION_ALERTS:
+        return
+    now = datetime.now(timezone.utc)
+    sent = st.setdefault("sess_sent", [])
+    for name, tz, oh, ch in SESSIONS:
+        op, cl = sess_times(tz, oh, ch, now)
+        if op.weekday() >= 5:
+            continue
+        day = op.strftime("%Y-%m-%d")
+        for kind, t in (("open", op), ("close", cl)):
+            k = f"{name}|{day}|{kind}"
+            # boundary ke 20 min ke andar hi alert (restart pe purana alert na aaye)
+            if k in sent or not (t <= now < t + timedelta(minutes=20)):
+                continue
+            sent.append(k)
+            if kind == "open":
+                act = [a for a in active_sessions(now) if a != name]
+                ov = f"\nOverlap: {name} + {', '.join(act)} (volume zyada)" if act else ""
+                send(f"🔔 {SESS_FLAG[name]} {name} session SHURU\n"
+                     f"Time: {dxb(op)} (Dubai)\nBand hoga: {dxb(cl)}{ov}")
+            else:
+                act = active_sessions(now)
+                nx = f"\nAbhi chalu: {', '.join(act)}" if act else "\nAbhi koi bada session chalu nahi"
+                send(f"🔕 {SESS_FLAG[name]} {name} session BAND\n"
+                     f"Time: {dxb(cl)} (Dubai){nx}")
+    st["sess_sent"] = sent[-30:]
+
 def main():
     start = time.time()
     print("bot started", flush=True)
-    send("✅ Crypto bot chalu hai: BTC + Gold (1m, 15m)")
+    st = load_state()
+    send("✅ Crypto bot chalu hai: BTC + Gold (1m, 5m, 15m)\n\n"
+         + status_15m() + "\n\n" + sessions_text())
     seen = {}
+    htf = {}  # sym -> 15m trend "BUY"/"SELL"
+    last_save = time.time()
     while time.time() - start < RUN_SECONDS:
+        check_day(st)
+        session_alerts(st)
         for sym in SYMBOLS:
             for tf, sec in TFS.items():
                 try:
                     c = get_candles(sym, tf, sec)
+                    if tf == "1" and c:
+                        track(st, sym, c)
                     key = (sym, tf)
                     if not c or seen.get(key) == c[-1]["t"]:
                         continue
                     seen[key] = c[-1]["t"]
+                    if tf == "15":
+                        cl = [x["c"] for x in c]
+                        htf[sym] = "BUY" if ema(cl, 20)[-1] > ema(cl, 50)[-1] else "SELL"
                     sigs = []
-                    ob = find_ob(c)
+                    ob = find_ob(c, tf)
                     if ob:
                         sigs.append(ob)
-                    sigs += find_cross(c)
-                    # 1m pe sideways market me alert nahi
-                    if sigs and tf == "1" and adx_last(c) < ADX_MIN:
-                        sigs = []
-                    label = "1m" if tf == "1" else "15m"
+                    sigs += find_cross(c, tf)
+                    if tf in ("1", "5") and sigs:
+                        # sideways market me alert nahi
+                        if adx_last(c) < ADX_MIN:
+                            sigs = []
+                        if SESSION_FILTER and not in_session():
+                            sigs = []
+                        if HTF_FILTER and sym in htf:
+                            sigs = [s for s in sigs if s[1] == htf[sym]]
+                    label = tf + "m"
+                    close_t = c[-1]["t"] + sec
                     for kind, side, e, sl, tp, extra in sigs:
                         msg = (f"{'🟢' if side == 'BUY' else '🔴'} {side} {sym} ({label})\n"
                                f"Type: {kind}\n"
-                               f"Entry: {e:.2f}\nSL: {sl:.2f}\n"
+                               f"{'Entry (limit)' if kind == 'OB Retest' else 'Entry'}: {e:.2f}\nSL: {sl:.2f}\n"
                                f"TP1: {tp[0]:.2f}\nTP2: {tp[1]:.2f}\n"
                                f"TP3: {tp[2]:.2f}")
                         if extra:
                             msg += "\n" + extra
+                        if tf in ("1", "5") and HTF_FILTER:
+                            msg += f"\n15m trend: {side} ✔"
                         send(msg)
+                        limit = kind == "OB Retest"
+                        st["trades"].append({
+                            "sym": sym, "tf": tf, "side": side, "entry": e,
+                            "sl": sl, "tps": tp, "hit": 0, "filled": not limit,
+                            "chk": close_t - 60,
+                            "expire": close_t + LIMIT_EXPIRE * sec})
+                        bump(st, f"{sym} {tf}m", "signals")
+                        if not limit:
+                            bump(st, f"{sym} {tf}m", "filled")
                 except Exception as ex:
                     print(sym, tf, "error:", ex, flush=True)
+        if time.time() - last_save > 300:
+            save_state(st)
+            last_save = time.time()
         time.sleep(10)
+    save_state(st)
 
 main()
 end = time.time() + 180
