@@ -1,0 +1,63 @@
+{
+ "trades": [
+  {
+   "sym": "XAUUSDT",
+   "tf": "15",
+   "side": "SELL",
+   "entry": 3577.6,
+   "sl": 3638.952142857143,
+   "tps": [
+    3516.247857142857,
+    3454.895714285714,
+    3393.543571428571
+   ],
+   "hit": 0,
+   "filled": true,
+   "chk": 1795543320,
+   "expire": 1795549500
+  }
+ ],
+ "day": "2026-11-24",
+ "stats": {
+  "BTCUSDT 1m": {
+   "signals": 2,
+   "filled": 2,
+   "tp1": 0,
+   "tp2": 0,
+   "tp3": 0,
+   "sl": 2,
+   "cancel": 0
+  },
+  "XAUUSDT 1m": {
+   "signals": 2,
+   "filled": 2,
+   "tp1": 2,
+   "tp2": 1,
+   "tp3": 1,
+   "sl": 0,
+   "cancel": 0
+  },
+  "XAUUSDT 5m": {
+   "signals": 1,
+   "filled": 1,
+   "tp1": 1,
+   "tp2": 1,
+   "tp3": 1,
+   "sl": 0,
+   "cancel": 0
+  },
+  "XAUUSDT 15m": {
+   "signals": 1,
+   "filled": 1,
+   "tp1": 0,
+   "tp2": 0,
+   "tp3": 0,
+   "sl": 0,
+   "cancel": 0
+  }
+ },
+ "sess_sent": [
+  "New York|2026-11-24|open",
+  "London|2026-11-24|close"
+ ]
+}
