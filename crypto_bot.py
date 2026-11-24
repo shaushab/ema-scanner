@@ -1,7 +1,7 @@
 import os, time, requests
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT = os.environ["TELEGRAM_CHAT_ID"]
+TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
+CHAT = os.environ["TELEGRAM_CHAT_ID"].strip()
 SYMBOLS = ["BTCUSDT", "XAUUSDT"]
 TFS = {"1": 60, "15": 900}  # interval -> seconds
 RUN_SECONDS = 5 * 3600 + 45 * 60
@@ -152,14 +152,21 @@ def find_cross(c):
     return out
 
 def send(text):
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT, "text": text}, timeout=15)
-        if r.status_code != 200:
+    for attempt in range(1, 5):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data={"chat_id": CHAT, "text": text}, timeout=40)
+            if r.status_code == 200:
+                print("Telegram OK", flush=True)
+                return True
             print("Telegram error:", r.status_code, r.text, flush=True)
-    except Exception as ex:
-        print("Telegram error:", ex, flush=True)
+            if r.status_code in (400, 401, 403, 404):
+                return False  # token ya chat id ka masla, retry se fayda nahi
+        except Exception as ex:
+            print("Telegram error (try", attempt, "):", ex, flush=True)
+        time.sleep(5)
+    return False
 
 def main():
     start = time.time()
