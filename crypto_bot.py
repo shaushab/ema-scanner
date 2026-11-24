@@ -1,4 +1,4 @@
-import os, time, requests
+import os, time, threading, queue, requests
 
 TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 CHAT = os.environ["TELEGRAM_CHAT_ID"].strip()
@@ -151,8 +151,10 @@ def find_cross(c):
         out.append((name, side, entry, sl, tps, ""))
     return out
 
-def send(text):
-    for attempt in range(1, 5):
+_q = queue.Queue()
+
+def _post(text):
+    for attempt in range(1, 9):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -161,12 +163,34 @@ def send(text):
                 print("Telegram OK", flush=True)
                 return True
             print("Telegram error:", r.status_code, r.text, flush=True)
+            if r.status_code == 429:  # Telegram ne roka hai, utna ruk ke dobara
+                try:
+                    wait = int(r.json().get("parameters", {}).get("retry_after", 10))
+                except Exception:
+                    wait = 10
+                time.sleep(wait + 1)
+                continue
             if r.status_code in (400, 401, 403, 404):
                 return False  # token ya chat id ka masla, retry se fayda nahi
         except Exception as ex:
             print("Telegram error (try", attempt, "):", ex, flush=True)
-        time.sleep(5)
+        time.sleep(min(5 * attempt, 20))
+    print("Telegram: message chhod diya (8 koshish ke baad)", flush=True)
     return False
+
+def _worker():
+    while True:
+        text = _q.get()
+        try:
+            _post(text)
+        finally:
+            time.sleep(1.2)  # Telegram limit: ~1 message/second
+            _q.task_done()
+
+threading.Thread(target=_worker, daemon=True).start()
+
+def send(text):
+    _q.put(text)  # main loop block nahi hota, alert background me jata hai
 
 def main():
     start = time.time()
@@ -205,3 +229,6 @@ def main():
         time.sleep(10)
 
 main()
+end = time.time() + 180
+while _q.unfinished_tasks and time.time() < end:
+    time.sleep(1)
