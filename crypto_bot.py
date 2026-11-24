@@ -16,7 +16,7 @@ SL_BUF = 0.3    # SL = zone ke bahar 0.3 x ATR
 PUSH_MAX = 1.5  # pichli 3 candles ka ulta push > 1.5 x ATR ho to OB signal skip
 ADX_MIN = 20    # 1m/5m pe isse neeche = sideways, alert band
 HTF_FILTER = True      # 1m/5m signal sirf 15m trend ki side me
-SESSION_FILTER = True  # 1m/5m alerts sirf London/NY session me
+SESSION_FILTER = False  # True = 1m/5m alerts sirf London/NY session me
 SESSION_ALERTS = True  # session shuru/band hone pe alert
 # (naam, city timezone, open hour, close hour) - local time, DST khud adjust
 SESSIONS = [("Tokyo", "Asia/Tokyo", 9, 18),
