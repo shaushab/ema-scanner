@@ -5,9 +5,6 @@ on:
     - cron: "*/30 * * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 concurrency:
   group: crypto-bot
   cancel-in-progress: false
@@ -27,13 +24,5 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-      - name: Save bot state (open trades + daily stats)
-        if: always()
-        run: |
-          git config user.name "crypto-bot"
-          git config user.email "crypto-bot@users.noreply.github.com"
-          git add crypto_state.json || exit 0
-          git diff --cached --quiet && exit 0
-          git commit -m "bot state update"
-          git pull --rebase
-          git push
+          WA_PHONE: ${{ secrets.WA_PHONE }}
+          WA_APIKEY: ${{ secrets.WA_APIKEY }}
