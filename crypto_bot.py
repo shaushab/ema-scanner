@@ -2,6 +2,7 @@ import os, time, threading, queue, requests
 
 TOKEN = os.environ["TELEGRAM_TOKEN"].strip()
 CHAT = os.environ["TELEGRAM_CHAT_ID"].strip()
+NTFY = os.environ.get("NTFY_TOPIC", "").strip()
 SYMBOLS = ["BTCUSDT", "XAUUSDT"]
 TFS = {"1": 60, "15": 900}  # interval -> seconds
 RUN_SECONDS = 5 * 3600 + 45 * 60
@@ -189,8 +190,37 @@ def _worker():
 
 threading.Thread(target=_worker, daemon=True).start()
 
+_nq = queue.Queue()
+
+def _ntfy_worker():
+    # ntfy.sh: free push notification, Telegram band ho tab bhi alert aaye
+    while True:
+        text = _nq.get()
+        try:
+            for attempt in range(1, 4):
+                try:
+                    r = requests.post(f"https://ntfy.sh/{NTFY}",
+                                      data=text.encode("utf-8"),
+                                      headers={"Title": "Crypto Alert", "Priority": "high"},
+                                      timeout=20)
+                    if r.status_code == 200:
+                        print("ntfy OK", flush=True)
+                        break
+                    print("ntfy error:", r.status_code, r.text[:200], flush=True)
+                except Exception as ex:
+                    print("ntfy error (try", attempt, "):", ex, flush=True)
+                time.sleep(3 * attempt)
+        finally:
+            time.sleep(0.5)
+            _nq.task_done()
+
+if NTFY:
+    threading.Thread(target=_ntfy_worker, daemon=True).start()
+
 def send(text):
     _q.put(text)  # main loop block nahi hota, alert background me jata hai
+    if NTFY:
+        _nq.put(text)
 
 def main():
     start = time.time()
@@ -230,5 +260,5 @@ def main():
 
 main()
 end = time.time() + 180
-while _q.unfinished_tasks and time.time() < end:
+while (_q.unfinished_tasks or _nq.unfinished_tasks) and time.time() < end:
     time.sleep(1)
