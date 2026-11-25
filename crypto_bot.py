@@ -459,31 +459,43 @@ def _tg_call(method, data, files=None):
     print("Telegram: message chhod diya (8 koshish ke baad)", flush=True)
     return False
 
+def _buttons(tg):
+    # Telegram copy buttons: tap karte hi value copy ho jati hai
+    rows = tg.get("copy") or []
+    if not rows:
+        return {}
+    kb = [[{"text": f"📋 {lab}: {val}", "copy_text": {"text": val}} for lab, val in row]
+          for row in rows]
+    return {"reply_markup": json.dumps({"inline_keyboard": kb})}
+
 def _post(item):
     text, tg = item
     tg = tg or {}
     cap = tg.get("html") or tg_plain(text)
     sent = False
-    if CHARTS and tg.get("chart") and ANIMATION:
-        try:  # moving chart (GIF)
-            gif = make_anim(tg["chart"])
-            sent = _tg_call("sendAnimation", {"chat_id": CHAT, "caption": cap[:1024],
-                                              "parse_mode": "HTML"},
-                            files={"animation": ("chart.gif", gif, "image/gif")})
-        except Exception as ex:
-            print("animation error:", ex, flush=True)
-    if CHARTS and tg.get("chart") and not sent:
-        try:
-            png = make_chart(tg["chart"])
-            sent = _tg_call("sendPhoto", {"chat_id": CHAT, "caption": cap[:1024],
-                                          "parse_mode": "HTML"},
-                            files={"photo": ("chart.png", png, "image/png")})
-        except Exception as ex:
-            print("chart error:", ex, flush=True)
-    if not sent:
-        ok = _tg_call("sendMessage", {"chat_id": CHAT, "text": cap, "parse_mode": "HTML"})
-        if not ok:  # HTML me masla ho to plain text
-            _tg_call("sendMessage", {"chat_id": CHAT, "text": text})
+    for rm in ([_buttons(tg), {}] if tg.get("copy") else [{}]):  # buttons fail ho to bina buttons
+        if sent:
+            break
+        if CHARTS and tg.get("chart") and ANIMATION:
+            try:  # moving chart (GIF)
+                gif = make_anim(tg["chart"])
+                sent = _tg_call("sendAnimation", {"chat_id": CHAT, "caption": cap[:1024],
+                                                  "parse_mode": "HTML", **rm},
+                                files={"animation": ("chart.gif", gif, "image/gif")})
+            except Exception as ex:
+                print("animation error:", ex, flush=True)
+        if CHARTS and tg.get("chart") and not sent:
+            try:
+                png = make_chart(tg["chart"])
+                sent = _tg_call("sendPhoto", {"chat_id": CHAT, "caption": cap[:1024],
+                                              "parse_mode": "HTML", **rm},
+                                files={"photo": ("chart.png", png, "image/png")})
+            except Exception as ex:
+                print("chart error:", ex, flush=True)
+        if not sent:
+            sent = _tg_call("sendMessage", {"chat_id": CHAT, "text": cap, "parse_mode": "HTML", **rm})
+    if not sent:  # HTML me masla ho to plain text
+        _tg_call("sendMessage", {"chat_id": CHAT, "text": text})
     if CHARTS and tg.get("sticker"):
         try:
             time.sleep(1.2)
@@ -913,7 +925,9 @@ def process(st, htf, sym, tf, sec, c, late=False):
             "html": signal_html(sym, label, kind, side, e, sl, tp, extra,
                                 tf in ("1", "5") and HTF_FILTER, t),
             "chart": chart_data(c, f"{sym} · {label} · {side} · {kind}", lv, zone),
-            "sticker": stk})
+            "sticker": stk,
+            "copy": [[("Entry", f"{e:.2f}"), ("SL", f"{sl:.2f}")],
+                     [("TP1", f"{tp[0]:.2f}"), ("TP2", f"{tp[1]:.2f}"), ("TP3", f"{tp[2]:.2f}")]]})
         limit = kind == "OB Retest"
         st["trades"].append({
             "sym": sym, "tf": tf, "side": side, "entry": e,
