@@ -521,78 +521,100 @@ def session_alerts(st):
                      f"Time: {dxb(cl)} (Dubai){nx}")
     st["sess_sent"] = sent[-30:]
 
+CATCHUP = {"15": 8, "5": 6, "1": 0}  # restart ke gap me chhuti candles (15m: 2 ghante tak)
+
+def process(st, htf, sym, tf, sec, c, late=False):
+    # ek closed candle (c[-1]) pe saare signals check karo
+    label = tf + "m"
+    tag = ""
+    if late:
+        t = datetime.fromtimestamp(c[-1]["t"] + sec, DXB).strftime("%I:%M %p").lstrip("0")
+        tag = f"\n⏰ Late alert: {t} wali candle (bot restart ke gap me close hui)"
+    if tf == "15":
+        br = ema200_break(c)
+        if br:
+            send(f"⚡ {sym} (15m): price EMA 200 ke {br[0]} close hua\n"
+                 f"Close: {c[-1]['c']:.2f} | EMA 200: {br[1]:.2f}\n"
+                 f"{'Trend bullish ho sakta hai' if br[0] == 'UPAR' else 'Trend bearish ho sakta hai'}"
+                 + tag, wa=True)
+        cl = [x["c"] for x in c]
+        htf[sym] = "BUY" if ema(cl, 20)[-1] > ema(cl, 50)[-1] else "SELL"
+    sigs = []
+    ob = find_ob(c, tf)
+    if ob:
+        sigs.append(ob)
+    sigs += find_cross(c, tf)
+    if tf in ("1", "5") and sigs:
+        if adx_last(c) < ADX_MIN:  # sideways market me alert nahi
+            sigs = []
+        if SESSION_FILTER and not in_session():
+            sigs = []
+        if HTF_FILTER and sym in htf:
+            sigs = [s for s in sigs if s[1] == htf[sym]]
+    close_t = c[-1]["t"] + sec
+    for kind, side, e, sl, tp, extra in sigs:
+        msg = (f"{'🟢' if side == 'BUY' else '🔴'} {side} {sym} ({label})\n"
+               f"Type: {kind}\n"
+               f"{'Entry (limit)' if kind == 'OB Retest' else 'Entry'}: {e:.2f}\nSL: {sl:.2f}\n"
+               f"TP1: {tp[0]:.2f}\nTP2: {tp[1]:.2f}\n"
+               f"TP3: {tp[2]:.2f}")
+        if extra:
+            msg += "\n" + extra
+        if tf in ("1", "5") and HTF_FILTER:
+            msg += f"\n15m trend: {side} ✔"
+        send(msg + tag, wa=True)
+        limit = kind == "OB Retest"
+        st["trades"].append({
+            "sym": sym, "tf": tf, "side": side, "entry": e,
+            "sl": sl, "tps": tp, "hit": 0, "filled": not limit,
+            "chk": close_t - 60,
+            "expire": close_t + LIMIT_EXPIRE * sec})
+        bump(st, f"{sym} {tf}m", "signals")
+        if not limit:
+            bump(st, f"{sym} {tf}m", "filled")
+
 def main():
     start = time.time()
     print("bot started", flush=True)
     st = load_state()
+    last = st.setdefault("last", {})  # "SYM|tf" -> aakhri check ki hui candle ka time
     send("✅ Crypto bot chalu hai: BTC + Gold (1m, 5m, 15m)\n\n"
          + status_15m() + "\n\n" + sessions_text()
          + ("\n\nWhatsApp: ON" if WA_PHONE and WA_APIKEY else "\n\nWhatsApp: OFF (secrets nahi mile)"))
-    seen = {}
     htf = {}  # sym -> 15m trend "BUY"/"SELL"
     last_save = time.time()
     while time.time() - start < RUN_SECONDS:
-        check_day(st)
-        session_alerts(st)
+        try:
+            check_day(st)
+            session_alerts(st)
+        except Exception as ex:
+            print("day/session error:", ex, flush=True)
         for sym in SYMBOLS:
             for tf, sec in TFS.items():
                 try:
                     c = get_candles(sym, tf, sec)
-                    if tf == "1" and c:
-                        track(st, sym, c)
-                    key = (sym, tf)
-                    if not c or seen.get(key) == c[-1]["t"]:
+                    if not c:
                         continue
-                    seen[key] = c[-1]["t"]
-                    if tf == "15":
-                        br = ema200_break(c)
-                        if br:
-                            send(f"⚡ {sym} (15m): price EMA 200 ke {br[0]} close hua\n"
-                                 f"Close: {c[-1]['c']:.2f} | EMA 200: {br[1]:.2f}\n"
-                                 f"{'Trend bullish ho sakta hai' if br[0] == 'UPAR' else 'Trend bearish ho sakta hai'}", wa=True)
-                        cl = [x["c"] for x in c]
-                        htf[sym] = "BUY" if ema(cl, 20)[-1] > ema(cl, 50)[-1] else "SELL"
-                    sigs = []
-                    ob = find_ob(c, tf)
-                    if ob:
-                        sigs.append(ob)
-                    sigs += find_cross(c, tf)
-                    if tf in ("1", "5") and sigs:
-                        # sideways market me alert nahi
-                        if adx_last(c) < ADX_MIN:
-                            sigs = []
-                        if SESSION_FILTER and not in_session():
-                            sigs = []
-                        if HTF_FILTER and sym in htf:
-                            sigs = [s for s in sigs if s[1] == htf[sym]]
-                    label = tf + "m"
-                    close_t = c[-1]["t"] + sec
-                    for kind, side, e, sl, tp, extra in sigs:
-                        msg = (f"{'🟢' if side == 'BUY' else '🔴'} {side} {sym} ({label})\n"
-                               f"Type: {kind}\n"
-                               f"{'Entry (limit)' if kind == 'OB Retest' else 'Entry'}: {e:.2f}\nSL: {sl:.2f}\n"
-                               f"TP1: {tp[0]:.2f}\nTP2: {tp[1]:.2f}\n"
-                               f"TP3: {tp[2]:.2f}")
-                        if extra:
-                            msg += "\n" + extra
-                        if tf in ("1", "5") and HTF_FILTER:
-                            msg += f"\n15m trend: {side} ✔"
-                        send(msg, wa=True)
-                        limit = kind == "OB Retest"
-                        st["trades"].append({
-                            "sym": sym, "tf": tf, "side": side, "entry": e,
-                            "sl": sl, "tps": tp, "hit": 0, "filled": not limit,
-                            "chk": close_t - 60,
-                            "expire": close_t + LIMIT_EXPIRE * sec})
-                        bump(st, f"{sym} {tf}m", "signals")
-                        if not limit:
-                            bump(st, f"{sym} {tf}m", "filled")
+                    if tf == "1":
+                        track(st, sym, c)
+                    key = f"{sym}|{tf}"
+                    prev = last.get(key, 0)
+                    if c[-1]["t"] <= prev:
+                        continue
+                    # kitni nayi closed candles hain (restart gap me chhuti hui bhi)
+                    new_idx = [i for i in range(len(c)) if c[i]["t"] > prev]
+                    if prev == 0:
+                        new_idx = new_idx[-1:]  # pehli baar: sirf latest
+                    new_idx = new_idx[-(CATCHUP[tf] + 1):]
+                    for i in new_idx:
+                        process(st, htf, sym, tf, sec, c[:i + 1], late=(i != len(c) - 1))
+                    last[key] = c[-1]["t"]
                 except Exception as ex:
                     print(sym, tf, "error:", ex, flush=True)
-        if time.time() - last_save > 300:
+        if time.time() - last_save > 60:
             save_state(st)
             last_save = time.time()
-        time.sleep(10)
+        time.sleep(5)
     save_state(st)
 
 main()
