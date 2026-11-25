@@ -189,18 +189,261 @@ def find_cross(c, tf="1"):
         out.append((name, side, entry, sl, tps, ""))
     return out
 
+# ---------- Telegram: stylish message + chart + sticker ----------
+import io, html, random, math
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.patches import Polygon, Circle, Rectangle
+    from PIL import Image
+    CHARTS = True
+except Exception as _ex:
+    print("chart libs nahi mili, sirf text jayega:", _ex, flush=True)
+    CHARTS = False
+
+BRAND = "SHAUSHAB"
+ANIMATION = True  # False = sirf static chart image
+FOOT = "\n━━━━━━━━━━━━━━\n⚡ <i>Shaushab Crypto Bot</i>"
+BG, GRID, TXT = "#0b0e11", "#1e2329", "#d1d4dc"
+UP, DN = "#0ecb81", "#f6465d"
+
+def tg_plain(text):
+    # simple text ko Telegram ke liye thoda stylish banao
+    lines = html.escape(text).split("\n")
+    lines[0] = f"<b>{lines[0]}</b>"
+    return "\n".join(lines) + FOOT
+
+def _limits(d):
+    c = d["c"]
+    ymin = min(x["l"] for x in c)
+    ymax = max(x["h"] for x in c)
+    for key in ("e20", "e50", "e200"):  # EMA 200 bhi hamesha chart me dikhe
+        if d.get(key):
+            ymin, ymax = min(ymin, min(d[key])), max(ymax, max(d[key]))
+    for price, _, _ in d.get("levels", []):
+        ymin, ymax = min(ymin, price), max(ymax, price)
+    pad = (ymax - ymin) * 0.08 or 1
+    return ymin - pad, ymax + pad
+
+def _frame(d, k, show_levels, size=(9, 5.4), dpi=100):
+    # pehli k candles tak ka chart ek PIL image me
+    c = d["c"]
+    n = len(c)
+    fig = Figure(figsize=size, dpi=dpi, facecolor=BG)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0.03, 0.06, 0.78, 0.85], facecolor=BG)
+    ax.set_ylim(*_limits(d))
+    ax.set_xlim(-1, n + 0.5)
+    w = 0.6
+    for i, x in enumerate(c[:k]):
+        col = UP if x["c"] >= x["o"] else DN
+        ax.vlines(i, x["l"], x["h"], color=col, linewidth=1)
+        lo, hi = sorted((x["o"], x["c"]))
+        ax.add_patch(Rectangle((i - w / 2, lo), w, max(hi - lo, (x["h"] - x["l"]) * 0.02 + 1e-9),
+                               color=col))
+    tags = []
+    for key, col, lab in (("e20", "#ff2e88", "EMA 20"), ("e50", "#3d7dff", "EMA 50"),
+                          ("e200", "#ffd400", "EMA 200")):
+        if d.get(key):
+            ax.plot(range(k), d[key][:k], color=col, linewidth=1.8, label=lab)
+            tags.append((d[key][k - 1], lab, col, "black" if key == "e200" else "white"))
+    if k:
+        last = c[k - 1]["c"]
+        tags.append((last, "PRICE", UP if c[k - 1]["c"] >= c[k - 1]["o"] else DN, "white"))
+        ax.axhline(last, color="#848e9c", linewidth=0.8, linestyle=":")
+    if show_levels:
+        if d.get("zone"):
+            zl, zh = d["zone"]
+            ax.axhspan(zl, zh, color="#a78bfa", alpha=0.18)
+            ax.text(1, zh, " OB zone", color="#c4b5fd", fontsize=8, va="bottom")
+        for price, lab, col in d.get("levels", []):
+            ax.axhline(price, color=col, linewidth=1.2, linestyle="--", alpha=0.9)
+            tags.append((price, lab, col, "white"))
+    lo_y, hi_y = ax.get_ylim()
+    gap = (hi_y - lo_y) * 0.048  # tags ek dusre pe na chadhe
+    tags.sort(key=lambda x: x[0])
+    ys = []
+    for price, *_ in tags:
+        y = max(price, ys[-1] + gap) if ys else price
+        ys.append(y)
+    over = ys[-1] - (hi_y - gap / 2) if ys else 0
+    if over > 0:
+        ys = [y - over for y in ys]
+    for (price, lab, col, fc), y in zip(tags, ys):  # right side value tags (app jaisa)
+        ax.text(n + 0.8, y, f" {lab} {price:.2f}", color=fc, fontsize=7.5,
+                va="center", ha="left", clip_on=False,
+                bbox=dict(boxstyle="round,pad=0.25", fc=col, ec="none"))
+    ax.set_yticks([])
+    ax.set_xticks([])
+    for sp in ax.spines.values():
+        sp.set_color(GRID)
+    ax.grid(color=GRID, linewidth=0.6)
+    ax.text(0.5, 0.5, BRAND, transform=ax.transAxes, fontsize=54, color="white",
+            alpha=0.05, ha="center", va="center", fontweight="bold")
+    ax.set_title(d.get("title", ""), color="white", fontsize=12, loc="left",
+                 fontweight="bold")
+    leg = ax.legend(loc="upper left", fontsize=8, facecolor=BG, edgecolor=GRID)
+    for t in leg.get_texts():
+        t.set_color(TXT)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=BG)
+    return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
+
+def make_chart(d):
+    buf = io.BytesIO()
+    _frame(d, len(d["c"]), True, dpi=110).save(buf, format="PNG")
+    return buf.getvalue()
+
+def make_anim(d, steps=24):
+    # GIF: candles ek ek karke bante hain, phir Entry/SL/TP lines aati hain
+    n = len(d["c"])
+    start = max(1, n - steps)
+    frames, durs = [], []
+    for k in range(start, n + 1):
+        frames.append(_frame(d, k, False, size=(7.2, 4.32)))
+        durs.append(110)
+    final = _frame(d, n, True, size=(7.2, 4.32))
+    frames.append(final)
+    durs.append(3500)  # aakhri frame thodi der ruke
+    pal = [f.quantize(colors=128, method=Image.Quantize.FASTOCTREE) for f in frames]
+    buf = io.BytesIO()
+    pal[0].save(buf, format="GIF", save_all=True, append_images=pal[1:],
+                duration=durs, loop=0, optimize=True)
+    return buf.getvalue()
+
+_stickers = {}
+
+def make_sticker(kind):
+    # 512x512 WEBP sticker: "rocket" ya "brand", naam SHAUSHAB ke saath
+    if kind in _stickers:
+        return _stickers[kind]
+    fig = Figure(figsize=(5.12, 5.12), dpi=100)
+    fig.patch.set_alpha(0)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+    if kind == "rocket":
+        ax.add_patch(Circle((5, 6.0), 3.7, color="#1a1f3a"))
+        for sx, sy in ((2.6, 8.0), (7.5, 7.8), (2.9, 4.6), (7.6, 4.4), (7.0, 8.4)):
+            ax.add_patch(Circle((sx, sy), 0.11, color="white"))
+        ax.add_patch(Polygon([[4.35, 4.6], [5.65, 4.6], [5.0, 3.1]], color="#ff9f1c"))  # flame
+        ax.add_patch(Polygon([[4.6, 4.6], [5.4, 4.6], [5.0, 3.7]], color="#ffd400"))
+        ax.add_patch(Rectangle((4.35, 4.6), 1.3, 2.8, color="#e8ecf1"))          # body
+        ax.add_patch(Polygon([[4.35, 7.4], [5.65, 7.4], [5.0, 8.6]], color="#f6465d"))  # nose
+        ax.add_patch(Polygon([[4.35, 4.6], [3.6, 4.4], [4.35, 5.8]], color="#f6465d"))  # fins
+        ax.add_patch(Polygon([[5.65, 4.6], [6.4, 4.4], [5.65, 5.8]], color="#f6465d"))
+        ax.add_patch(Circle((5, 6.6), 0.38, color="#3d7dff"))                  # window
+        ax.text(5, 9.0, "TO THE MOON", ha="center", va="center", fontsize=13,
+                color="#ffd400", fontweight="bold")
+        ax.add_patch(Rectangle((0.5, 0.6), 9.0, 1.7, color="#0ecb81"))
+        ax.text(5, 1.45, BRAND, ha="center", va="center", fontsize=34, color="white",
+                fontweight="bold")
+    else:
+        ax.add_patch(Circle((5, 5), 4.7, color="#0ecb81"))
+        ax.add_patch(Circle((5, 5), 4.2, color="#0b0e11"))
+        ax.text(5, 5.5, BRAND, ha="center", va="center", fontsize=34, color="white",
+                fontweight="bold")
+        ax.text(5, 4.0, "CRYPTO BOT", ha="center", va="center", fontsize=16,
+                color="#0ecb81", fontweight="bold")
+        ax.text(5, 7.1, "BTC  •  GOLD", ha="center", va="center", fontsize=12, color="#ffd400")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    img = Image.open(io.BytesIO(buf.getvalue())).convert("RGBA").resize((512, 512))
+    out = io.BytesIO()
+    img.save(out, format="WEBP")
+    _stickers[kind] = out.getvalue()
+    return _stickers[kind]
+
+_anims = {}
+
+def _rocket_frame(i, nf):
+    fig = Figure(figsize=(4, 4), dpi=100, facecolor="#0b1026")
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1], facecolor="#0b1026")
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+    rnd = random.Random(7)
+    for _ in range(28):  # stars neeche ki taraf chalte hain = rocket upar ja raha
+        sx, sy, sp = rnd.uniform(0, 10), rnd.uniform(0, 10), rnd.uniform(0.15, 0.45)
+        y = (sy - i * sp) % 10
+        ax.add_patch(Circle((sx, y), rnd.uniform(0.04, 0.1), color="white",
+                            alpha=rnd.uniform(0.4, 1)))
+    t = i / nf
+    rise = min(1, t * 1.6)
+    cx = 5 + 0.15 * math.sin(i * 0.9)          # halka wobble
+    by = 1.2 + rise * 2.6                       # rocket neeche se upar aata hai
+    fl = 1.0 + 0.45 * abs(math.sin(i * 1.7))    # flame flicker
+    ax.add_patch(Polygon([[cx - 0.6, by], [cx + 0.6, by], [cx, by - 1.3 * fl]], color="#ff6b1a"))
+    ax.add_patch(Polygon([[cx - 0.35, by], [cx + 0.35, by], [cx, by - 0.8 * fl]], color="#ffd400"))
+    ax.add_patch(Rectangle((cx - 0.6, by), 1.2, 2.5, color="#e8ecf1"))
+    ax.add_patch(Polygon([[cx - 0.6, by + 2.5], [cx + 0.6, by + 2.5], [cx, by + 3.6]], color="#f6465d"))
+    ax.add_patch(Polygon([[cx - 0.6, by], [cx - 1.3, by - 0.2], [cx - 0.6, by + 1.1]], color="#f6465d"))
+    ax.add_patch(Polygon([[cx + 0.6, by], [cx + 1.3, by - 0.2], [cx + 0.6, by + 1.1]], color="#f6465d"))
+    ax.add_patch(Circle((cx, by + 1.7), 0.33, color="#3d7dff"))
+    ax.add_patch(Rectangle((0.4, 0.25), 9.2, 1.45, color="#0ecb81"))
+    k = min(len(BRAND), int(t * 2.2 * len(BRAND)) + 1)  # naam letter by letter
+    ax.text(5, 0.97, BRAND[:k], ha="center", va="center", fontsize=30, color="white",
+            fontweight="bold")
+    if t > 0.45:
+        ax.text(5, 9.1, "TO THE MOON", ha="center", va="center", fontsize=20,
+                color="#ffd400", fontweight="bold", alpha=min(1, (t - 0.45) * 4))
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor="#0b1026")
+    return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
+
+def _brand_frame(i, nf):
+    fig = Figure(figsize=(4, 4), dpi=100, facecolor=BG)
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0, 0, 1, 1], facecolor=BG)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.axis("off")
+    from matplotlib.patches import Wedge
+    a0 = -i * (360 / nf)  # ghoomta hua green ring
+    ax.add_patch(Circle((5, 5), 4.6, color="#1e2329"))
+    ax.add_patch(Wedge((5, 5), 4.6, a0, a0 + 250, width=0.45, color="#0ecb81"))
+    ax.add_patch(Wedge((5, 5), 4.6, a0 + 270, a0 + 340, width=0.45, color="#ffd400"))
+    sc = 1 + 0.08 * math.sin(i / nf * 2 * math.pi * 2)  # naam pulse karta hai
+    ax.text(5, 5.4, BRAND, ha="center", va="center", fontsize=32 * sc, color="white",
+            fontweight="bold")
+    ax.text(5, 3.9, "CRYPTO BOT", ha="center", va="center", fontsize=15, color="#0ecb81",
+            fontweight="bold")
+    ax.text(5, 7.0, "BTC  •  GOLD", ha="center", va="center", fontsize=12, color="#ffd400")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=BG)
+    return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
+
+def make_sticker_anim(kind):
+    # animated sticker (GIF): rocket upar udta hai / SHAUSHAB badge ghoomta hai
+    if kind in _anims:
+        return _anims[kind]
+    nf = 32
+    fn = _rocket_frame if kind == "rocket" else _brand_frame
+    frames = [fn(i, nf).quantize(colors=96, method=Image.Quantize.FASTOCTREE) for i in range(nf)]
+    durs = [70] * nf
+    durs[-1] = 900
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                   duration=durs, loop=0, optimize=True)
+    _anims[kind] = buf.getvalue()
+    return _anims[kind]
+
 _q = queue.Queue()
 
-def _post(text):
+def _tg_call(method, data, files=None):
     for attempt in range(1, 9):
         try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                data={"chat_id": CHAT, "text": text}, timeout=40)
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}",
+                              data=data, files=files, timeout=60)
             if r.status_code == 200:
-                print("Telegram OK", flush=True)
+                print("Telegram OK", method, flush=True)
                 return True
-            print("Telegram error:", r.status_code, r.text, flush=True)
+            print("Telegram error:", r.status_code, r.text[:300], flush=True)
             if r.status_code == 429:  # Telegram ne roka hai, utna ruk ke dobara
                 try:
                     wait = int(r.json().get("parameters", {}).get("retry_after", 10))
@@ -209,18 +452,60 @@ def _post(text):
                 time.sleep(wait + 1)
                 continue
             if r.status_code in (400, 401, 403, 404):
-                return False  # token ya chat id ka masla, retry se fayda nahi
+                return False  # galat format / token ka masla, retry se fayda nahi
         except Exception as ex:
             print("Telegram error (try", attempt, "):", ex, flush=True)
         time.sleep(min(5 * attempt, 20))
     print("Telegram: message chhod diya (8 koshish ke baad)", flush=True)
     return False
 
+def _post(item):
+    text, tg = item
+    tg = tg or {}
+    cap = tg.get("html") or tg_plain(text)
+    sent = False
+    if CHARTS and tg.get("chart") and ANIMATION:
+        try:  # moving chart (GIF)
+            gif = make_anim(tg["chart"])
+            sent = _tg_call("sendAnimation", {"chat_id": CHAT, "caption": cap[:1024],
+                                              "parse_mode": "HTML"},
+                            files={"animation": ("chart.gif", gif, "image/gif")})
+        except Exception as ex:
+            print("animation error:", ex, flush=True)
+    if CHARTS and tg.get("chart") and not sent:
+        try:
+            png = make_chart(tg["chart"])
+            sent = _tg_call("sendPhoto", {"chat_id": CHAT, "caption": cap[:1024],
+                                          "parse_mode": "HTML"},
+                            files={"photo": ("chart.png", png, "image/png")})
+        except Exception as ex:
+            print("chart error:", ex, flush=True)
+    if not sent:
+        ok = _tg_call("sendMessage", {"chat_id": CHAT, "text": cap, "parse_mode": "HTML"})
+        if not ok:  # HTML me masla ho to plain text
+            _tg_call("sendMessage", {"chat_id": CHAT, "text": text})
+    if CHARTS and tg.get("sticker"):
+        try:
+            time.sleep(1.2)
+            ok = False
+            if ANIMATION:
+                try:
+                    ok = _tg_call("sendAnimation", {"chat_id": CHAT},
+                                  files={"animation": ("shaushab.gif",
+                                                       make_sticker_anim(tg["sticker"]), "image/gif")})
+                except Exception as ex:
+                    print("sticker anim error:", ex, flush=True)
+            if not ok:
+                _tg_call("sendSticker", {"chat_id": CHAT},
+                         files={"sticker": ("s.webp", make_sticker(tg["sticker"]), "image/webp")})
+        except Exception as ex:
+            print("sticker error:", ex, flush=True)
+
 def _worker():
     while True:
-        text = _q.get()
+        item = _q.get()
         try:
-            _post(text)
+            _post(item)
         finally:
             time.sleep(1.2)  # Telegram limit: ~1 message/second
             _q.task_done()
@@ -281,8 +566,9 @@ def _wa_worker():
 if WA_PHONE and WA_APIKEY:
     threading.Thread(target=_wa_worker, daemon=True).start()
 
-def send(text, wa=False):
-    _q.put(text)  # main loop block nahi hota, alert background me jata hai
+def send(text, wa=False, tg=None):
+    # tg = {"html": stylish Telegram text, "chart": chart data, "sticker": "rocket"/"brand"}
+    _q.put((text, tg))  # main loop block nahi hota, alert background me jata hai
     if NTFY:
         _nq.put(text)
     if wa and WA_PHONE and WA_APIKEY:  # WhatsApp pe sirf zaroori alerts
@@ -361,6 +647,33 @@ def ema200_break(c):
         return "NEECHE", e200[-1]
     return None
 
+def chart_data(c, title, levels=(), zone=None, n=70):
+    cl = [x["c"] for x in c]
+    e20, e50, e200 = ema(cl, 20), ema(cl, 50), ema(cl, 200)
+    return {"c": c[-n:], "e20": e20[-n:], "e50": e50[-n:],
+            "e200": e200[-n:] if len(c) >= 200 else None,
+            "levels": list(levels), "zone": zone, "title": title}
+
+def signal_html(sym, label, kind, side, e, sl, tp, extra, trend_ok, late_t):
+    risk = abs(e - sl)
+    pct = risk / e * 100 if e else 0
+    h = (f"{'🟢' if side == 'BUY' else '🔴'} <b>{side} · {sym}</b>  <i>({label})</i>\n"
+         f"━━━━━━━━━━━━━━\n"
+         f"📌 <b>Type:</b> {kind}\n"
+         f"🎯 <b>Entry:</b> <code>{e:.2f}</code>{' (limit)' if kind == 'OB Retest' else ''}\n"
+         f"🛑 <b>SL:</b> <code>{sl:.2f}</code>  <i>(risk {pct:.2f}%)</i>\n"
+         f"✅ <b>TP1:</b> <code>{tp[0]:.2f}</code>  <i>1R</i>\n"
+         f"✅ <b>TP2:</b> <code>{tp[1]:.2f}</code>  <i>2R</i>\n"
+         f"🚀 <b>TP3:</b> <code>{tp[2]:.2f}</code>  <i>3R</i>\n")
+    for ln in (extra or "").split("\n"):
+        if ln:
+            h += f"📦 {html.escape(ln)}\n"
+    if trend_ok:
+        h += f"📈 15m trend: {side} ✔\n"
+    if late_t:
+        h += f"⏰ <i>Late alert: {late_t} wali candle</i>\n"
+    return h.rstrip("\n") + FOOT
+
 # ---------- trade tracking + daily summary ----------
 def load_state():
     try:
@@ -406,7 +719,7 @@ def summary_text(day, stats):
 def check_day(st):
     today = datetime.now(DXB).strftime("%Y-%m-%d")
     if today != st["day"]:
-        send(summary_text(st["day"], st["stats"]), wa=True)
+        send(summary_text(st["day"], st["stats"]), wa=True, tg={"sticker": "brand"})
         st["day"], st["stats"] = today, {}
         save_state(st)
 
@@ -419,6 +732,15 @@ def track(st, sym, c1):
             continue
         key = f"{sym} {t['tf']}m"
         head = f"{sym} ({t['tf']}m) {t['side']} @ {t['entry']:.2f}"
+        lv = [(t["entry"], "ENTRY", "#5e6673"), (t["sl"], "SL", "#f6465d")] + \
+             [(p, f"TP{i + 1}", "#0a9e66") for i, p in enumerate(t["tps"])]
+
+        def tgm(icon, title, extra_line, sticker=None):
+            return {"html": (f"{icon} <b>{title}</b>\n━━━━━━━━━━━━━━\n"
+                             f"🪙 <b>{sym}</b>  <i>({t['tf']}m)</i>  ·  {t['side']}\n"
+                             f"🎯 Entry: <code>{t['entry']:.2f}</code>\n{extra_line}" + FOOT),
+                    "chart": chart_data(c1, f"{sym} · 1m · {title}", lv, n=60),
+                    "sticker": sticker}
         buy = t["side"] == "BUY"
         alive = True
         for x in c1:
@@ -429,7 +751,8 @@ def track(st, sym, c1):
                 if (x["l"] <= t["entry"]) if buy else (x["h"] >= t["entry"]):
                     t["filled"] = True
                     bump(st, key, "filled")
-                    send(f"📥 Limit fill: {head}")
+                    send(f"📥 Limit fill: {head}",
+                         tg=tgm("📥", "LIMIT ORDER FILL", "Trade ab active hai 💪"))
                 elif x["t"] > t["expire"]:
                     bump(st, key, "cancel")
                     send(f"⌛ Cancel (fill nahi hua): {head}")
@@ -441,9 +764,11 @@ def track(st, sym, c1):
             if (x["l"] <= t["sl"]) if buy else (x["h"] >= t["sl"]):
                 if t["hit"] == 0:
                     bump(st, key, "sl")
-                    send(f"🛑 SL hit: {head}", wa=True)
+                    send(f"🛑 SL hit: {head}", wa=True,
+                         tg=tgm("🛑", "STOP LOSS HIT", f"❌ SL: <code>{t['sl']:.2f}</code>\n<i>Koi baat nahi, next trade 💪</i>"))
                 else:
-                    send(f"↩️ TP{t['hit']} ke baad SL hit: {head}", wa=True)
+                    send(f"↩️ TP{t['hit']} ke baad SL hit: {head}", wa=True,
+                         tg=tgm("↩️", f"TP{t['hit']} KE BAAD SL HIT", f"✅ TP{t['hit']} pehle hi mil chuka tha"))
                 alive = False
                 break
             for n in range(t["hit"] + 1, 4):
@@ -451,7 +776,10 @@ def track(st, sym, c1):
                 if (x["h"] >= tp) if buy else (x["l"] <= tp):
                     t["hit"] = n
                     bump(st, key, f"tp{n}")
-                    send(f"✅ TP{n} hit: {head} → {tp:.2f}", wa=True)
+                    send(f"✅ TP{n} hit: {head} → {tp:.2f}", wa=True,
+                         tg=tgm("🚀" if n == 3 else "✅", f"TP{n} HIT" + (" · FULL TARGET" if n == 3 else ""),
+                                f"💰 TP{n}: <code>{tp:.2f}</code>  <i>(+{n}R)</i>",
+                                "rocket" if n >= 2 else None))
             if t["hit"] == 3:
                 alive = False
                 break
@@ -527,6 +855,7 @@ def process(st, htf, sym, tf, sec, c, late=False):
     # ek closed candle (c[-1]) pe saare signals check karo
     label = tf + "m"
     tag = ""
+    t = ""
     if late:
         t = datetime.fromtimestamp(c[-1]["t"] + sec, DXB).strftime("%I:%M %p").lstrip("0")
         tag = f"\n⏰ Late alert: {t} wali candle (bot restart ke gap me close hui)"
@@ -536,7 +865,15 @@ def process(st, htf, sym, tf, sec, c, late=False):
             send(f"⚡ {sym} (15m): price EMA 200 ke {br[0]} close hua\n"
                  f"Close: {c[-1]['c']:.2f} | EMA 200: {br[1]:.2f}\n"
                  f"{'Trend bullish ho sakta hai' if br[0] == 'UPAR' else 'Trend bearish ho sakta hai'}"
-                 + tag, wa=True)
+                 + tag, wa=True,
+                 tg={"html": (f"⚡ <b>EMA 200 BREAK · {sym}</b>  <i>(15m)</i>\n━━━━━━━━━━━━━━\n"
+                              f"Price EMA 200 ke <b>{br[0]}</b> close hua {'⬆️' if br[0] == 'UPAR' else '⬇️'}\n"
+                              f"💰 Close: <code>{c[-1]['c']:.2f}</code>\n"
+                              f"🟡 EMA 200: <code>{br[1]:.2f}</code>\n"
+                              f"{'📈 Trend bullish ho sakta hai' if br[0] == 'UPAR' else '📉 Trend bearish ho sakta hai'}"
+                              + (f"\n⏰ <i>Late alert: {t} wali candle</i>" if late else "") + FOOT),
+                     "chart": chart_data(c, f"{sym} · 15m · EMA 200 break",
+                                         [(br[1], "EMA200", "#b8a000")])})
         cl = [x["c"] for x in c]
         htf[sym] = "BUY" if ema(cl, 20)[-1] > ema(cl, 50)[-1] else "SELL"
     sigs = []
@@ -562,7 +899,21 @@ def process(st, htf, sym, tf, sec, c, late=False):
             msg += "\n" + extra
         if tf in ("1", "5") and HTF_FILTER:
             msg += f"\n15m trend: {side} ✔"
-        send(msg + tag, wa=True)
+        lv = [(e, "ENTRY", "#5e6673"), (sl, "SL", "#f6465d"),
+              (tp[0], "TP1", "#0a9e66"), (tp[1], "TP2", "#0a9e66"), (tp[2], "TP3", "#0a9e66")]
+        zone = None
+        if kind == "OB Retest" and extra.startswith("OB zone:"):
+            try:
+                zl, zh = extra.split("\n")[0].replace("OB zone:", "").split(" - ")
+                zone = (float(zl), float(zh))
+            except Exception:
+                zone = None
+        stk = "brand" if tf == "15" else ("brand" if random.random() < 0.2 else None)
+        send(msg + tag, wa=True, tg={
+            "html": signal_html(sym, label, kind, side, e, sl, tp, extra,
+                                tf in ("1", "5") and HTF_FILTER, t),
+            "chart": chart_data(c, f"{sym} · {label} · {side} · {kind}", lv, zone),
+            "sticker": stk})
         limit = kind == "OB Retest"
         st["trades"].append({
             "sym": sym, "tf": tf, "side": side, "entry": e,
@@ -580,7 +931,8 @@ def main():
     last = st.setdefault("last", {})  # "SYM|tf" -> aakhri check ki hui candle ka time
     send("✅ Crypto bot chalu hai: BTC + Gold (1m, 5m, 15m)\n\n"
          + status_15m() + "\n\n" + sessions_text()
-         + ("\n\nWhatsApp: ON" if WA_PHONE and WA_APIKEY else "\n\nWhatsApp: OFF (secrets nahi mile)"))
+         + ("\n\nWhatsApp: ON" if WA_PHONE and WA_APIKEY else "\n\nWhatsApp: OFF (secrets nahi mile)"),
+         tg={"sticker": "brand"})
     htf = {}  # sym -> 15m trend "BUY"/"SELL"
     last_save = time.time()
     while time.time() - start < RUN_SECONDS:
