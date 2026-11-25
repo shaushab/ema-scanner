@@ -13,31 +13,79 @@
    ],
    "hit": 0,
    "filled": true,
-   "chk": 1795543320,
+   "chk": 1795566960,
    "expire": 1795549500
+  },
+  {
+   "sym": "XAUUSDT",
+   "tf": "5",
+   "side": "SELL",
+   "entry": 3561.0,
+   "sl": 3575.4,
+   "tps": [
+    3546.6,
+    3532.2,
+    3517.7999999999997
+   ],
+   "hit": 1,
+   "filled": true,
+   "chk": 1795566960,
+   "expire": 1795566900
+  },
+  {
+   "sym": "XAUUSDT",
+   "tf": "1",
+   "side": "SELL",
+   "entry": 3557.9,
+   "sl": 3564.525,
+   "tps": [
+    3551.275,
+    3544.65,
+    3538.025
+   ],
+   "hit": 1,
+   "filled": true,
+   "chk": 1795566960,
+   "expire": 1795564980
+  },
+  {
+   "sym": "BTCUSDT",
+   "tf": "5",
+   "side": "SELL",
+   "entry": 59639.6,
+   "sl": 60037.755,
+   "tps": [
+    59241.445,
+    58843.29,
+    58445.135
+   ],
+   "hit": 0,
+   "filled": true,
+   "chk": 1795566960,
+   "expire": 1795568400
   }
  ],
- "day": "2026-11-24",
+ "day": "2026-11-25",
  "stats": {
-  "BTCUSDT 1m": {
-   "signals": 2,
-   "filled": 2,
-   "tp1": 0,
-   "tp2": 0,
-   "tp3": 0,
-   "sl": 2,
-   "cancel": 0
-  },
   "XAUUSDT 1m": {
    "signals": 2,
    "filled": 2,
    "tp1": 2,
-   "tp2": 1,
-   "tp3": 1,
-   "sl": 0,
+   "tp2": 0,
+   "tp3": 0,
+   "sl": 1,
    "cancel": 0
   },
   "XAUUSDT 5m": {
+   "signals": 1,
+   "filled": 1,
+   "tp1": 1,
+   "tp2": 0,
+   "tp3": 0,
+   "sl": 0,
+   "cancel": 0
+  },
+  "BTCUSDT 1m": {
    "signals": 1,
    "filled": 1,
    "tp1": 1,
@@ -46,7 +94,7 @@
    "sl": 0,
    "cancel": 0
   },
-  "XAUUSDT 15m": {
+  "BTCUSDT 5m": {
    "signals": 1,
    "filled": 1,
    "tp1": 0,
@@ -58,6 +106,8 @@
  },
  "sess_sent": [
   "New York|2026-11-24|open",
-  "London|2026-11-24|close"
+  "London|2026-11-24|close",
+  "New York|2026-11-24|close",
+  "Tokyo|2026-11-25|open"
  ]
 }
