@@ -340,6 +340,8 @@ def make_chart(d):
     near = lambda lo_, hi_: lo_ > cand_lo - span * 0.8 and hi_ < cand_hi + span * 0.8
     smc = {"ev": [], "hs": [], "ls": [], "fvg": [], "ob": [], "eqh": [], "eql": []}
     try:
+        if d.get("ema_only"):
+            raise StopIteration  # /ema chart: sirf EMA + cross points
         atr = atr_list(full)
         trend, ev, hs, ls = structure(full)
         smc.update(ev=ev, hs=hs, ls=ls)
@@ -356,6 +358,8 @@ def make_chart(d):
         eqh, eql = liquidity(full, hs, ls, atr)
         smc["eqh"] = [v for v in eqh if near(v[1], v[1])][-1:]
         smc["eql"] = [v for v in eql if near(v[1], v[1])][-1:]
+    except StopIteration:
+        pass
     except Exception as ex:
         print("smc calc error:", ex, flush=True)
 
@@ -396,6 +400,13 @@ def make_chart(d):
         if key in emas:
             ax.plot(range(n), emas[key], color=col, linewidth=1.5, alpha=0.9, zorder=2, label=lab)
 
+    # ---- EMA cross points ----
+    for xi, xp, xl, xc in d.get("xmarks", []):
+        if xi >= off:
+            ax.scatter([xi - off], [xp], s=110, facecolor=xc, edgecolor="white", linewidth=1.5, zorder=9)
+            ax.annotate(xl, (xi - off, xp), xytext=(0, 14), textcoords="offset points", color=xc,
+                        fontsize=8, ha="center", fontweight="bold", zorder=9,
+                        bbox=dict(boxstyle="round,pad=0.2", fc="#0d2418", ec=xc, alpha=0.95))
     # ---- Equilibrium (range ka 50%) ----
     eqp = (cand_lo + cand_hi) / 2
     ax.hlines(eqp, -0.5, n, color="#9fb5a8", linewidth=0.8, linestyle=(0, (2, 4)), alpha=0.6, zorder=1)
@@ -412,8 +423,13 @@ def make_chart(d):
         h = len(lines_) * fs * 0.0185 / axh_in * (yh0 - yl0)
         x0_ = x - w / 2 if ha == "center" else (x if ha == "left" else x - w)
         y0_ = y - h / 2 if va == "center" else (y if va == "bottom" else y - h)
+        if x0_ < -0.8:  # chart ke bahar na jaaye
+            x += -0.8 - x0_
+            x0_ = -0.8
         for dy in (0, h * 1.1, -h * 1.1, h * 2.2, -h * 2.2, h * 3.3, -h * 3.3):
             box = (x0_, y0_ + dy, x0_ + w, y0_ + dy + h)
+            if box[1] < yl0 or box[3] > yh0:
+                continue
             if all(box[2] < b_[0] or box[0] > b_[2] or box[3] < b_[1] or box[1] > b_[3]
                    for b_ in placed):
                 placed.append(box)
@@ -519,6 +535,8 @@ def make_chart(d):
     except Exception as ex:
         print("smc overlay error:", ex, flush=True)
     put(n - 0.5, eqp, "Equilibrium 50%", fs=7, color="#9fb5a8", ha="right", va="bottom", zorder=6)
+    if d.get("ema_only"):
+        shown = ["● = EMA cross point", "EMA 20 / 50 / 200"]
     # chart pe kya kya dikh raha hai (info strip)
     ax.text(0.995, 0.985, "  ·  ".join(shown), transform=ax.transAxes, color="#cfd8d3",
             fontsize=7.5, ha="right", va="top", zorder=9,
@@ -774,9 +792,14 @@ def _post(item):
         if CHARTS and tg.get("chart") and not sent:
             try:
                 png = make_chart(tg["chart"])
-                sent = _tg_call("sendPhoto", {"chat_id": chat, "caption": cap[:1024],
-                                              "parse_mode": "HTML", **rm},
+                long_ = len(cap) > 1024  # Telegram caption limit: lamba text alag message me
+                pcap = cap.split("\n")[0] if long_ else cap
+                sent = _tg_call("sendPhoto", {"chat_id": chat, "caption": pcap,
+                                              "parse_mode": "HTML", **({} if long_ else rm)},
                                 files={"photo": ("chart.png", png, "image/png")})
+                if sent and long_:
+                    time.sleep(1.0)
+                    _tg_call("sendMessage", {"chat_id": chat, "text": cap, "parse_mode": "HTML", **rm})
             except Exception as ex:
                 print("chart error:", ex, flush=True)
         if not sent:
@@ -1438,16 +1461,125 @@ def cmd_trend(args):
     h += f"━━━━━━━━━━━━━━\n🧭 <b>Overall bias:</b> {bias}  <i>(score {score:+d})</i>"
     return {"html": h + FOOT}
 
+TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200,
+          "4h": 14400, "1d": 86400}
+
+def fetch_long(sym, tf, pages=3):
+    # zyada history (EMA 200 sahi banane ke liye): 3 x 300 candles
+    out, after = [], None
+    for _ in range(pages):
+        params = {"instId": OKX_IDS[sym], "bar": BARS.get(tf, tf), "limit": 300}
+        if after:
+            params["after"] = after
+        r = requests.get("https://www.okx.com/api/v5/market/candles", params=params, timeout=15)
+        r.raise_for_status()
+        j = r.json()
+        if j.get("code") != "0" or not j["data"]:
+            break
+        out += j["data"]
+        after = j["data"][-1][0]
+    rows = sorted({x[0]: x for x in out}.values(), key=lambda x: int(x[0]))
+    return [{"t": int(x[0]) // 1000, "o": float(x[1]), "h": float(x[2]),
+             "l": float(x[3]), "c": float(x[4])} for x in rows]
+
+def _when(ts):
+    dt = datetime.fromtimestamp(ts, DXB)
+    today = datetime.now(DXB).date()
+    if dt.date() == today:
+        return dt.strftime("%I:%M %p").lstrip("0") + " today"
+    if dt.date() == today - timedelta(days=1):
+        return dt.strftime("%I:%M %p").lstrip("0") + " yesterday"
+    if dt.date() == today + timedelta(days=1):
+        return dt.strftime("%I:%M %p").lstrip("0") + " tomorrow"
+    return dt.strftime("%d %b %I:%M %p")
+
+def _dur(sec_):
+    m = int(sec_ // 60)
+    if m < 60:
+        return f"{m} min"
+    h_, m = divmod(m, 60)
+    if h_ < 48:
+        return f"{h_}h {m}m"
+    return f"{h_ // 24} days"
+
+def cross_report(c, a, b, start, sec, name_a, name_b):
+    # last cross kab hua + next cross kab ho sakta hai (estimate)
+    diff = [x - y for x, y in zip(a, b)]
+    last = None
+    for i in range(len(c) - 1, max(start, 1), -1):
+        if (diff[i - 1] <= 0) != (diff[i] <= 0):
+            last = (i, "BULLISH" if diff[i] > 0 else "BEARISH")
+            break
+    now_close = c[-1]["t"] + sec
+    res = {"last": None, "next": None, "above": diff[-1] > 0, "gap": diff[-1]}
+    if last:
+        i, kind = last
+        res["last"] = (kind, c[i]["t"] + sec, i)
+    k = 5
+    slope = (diff[-1] - diff[-1 - k]) / k if len(diff) > k else 0
+    if diff[-1] != 0 and slope != 0 and (diff[-1] > 0) != (slope > 0):
+        bars = abs(diff[-1]) / abs(slope)
+        if bars <= 150:
+            kind = "BEARISH" if diff[-1] > 0 else "BULLISH"
+            res["next"] = (kind, now_close + bars * sec, bars)
+    return res
+
 def cmd_ema(args):
     sym, tf = parse_args(args)
-    c = fetch(sym, tf)
-    lab, e20, e50, e200 = ema_trend(c)
-    p = c[-1]["c"]
-    h = head(sym, tf, "📈 EMA Status")
-    for n_, v in (("EMA 20", e20), ("EMA 50", e50), ("EMA 200", e200)):
-        h += f"{n_}: <code>{v:.2f}</code>  ({(p - v) / v * 100:+.2f}%)\n"
-    h += f"Price: <code>{p:.2f}</code>\nTrend: {lab}"
-    return {"html": h + FOOT, "chart": chart_data(c, f"{sym} · {tf} · EMA"), "static": True}
+    sec = TF_SEC.get(tf, 900)
+    try:
+        c = fetch_long(sym, tf)
+    except Exception:
+        c = fetch(sym, tf)
+    cl = [x["c"] for x in c]
+    e20, e50, e200 = ema(cl, 20), ema(cl, 50), ema(cl, 200)
+    lab, _, _, _ = ema_trend(c)
+    p = cl[-1]
+    h = head(sym, tf, "📈 EMA Cross Report")
+    for n_, v in (("EMA 20", e20[-1]), ("EMA 50", e50[-1]), ("EMA 200", e200[-1])):
+        h += f"{n_}: <code>{v:.2f}</code>  (price {(p - v) / v * 100:+.2f}%)\n"
+    h += f"Price: <code>{p:.2f}</code> · Trend: {lab}\n━━━━━━━━━━━━━━\n"
+    pairs = [("EMA 20", e20, "EMA 50", e50, 60), ("EMA 50", e50, "EMA 200", e200, 210),
+             ("EMA 20", e20, "EMA 200", e200, 210), ("Price", cl, "EMA 200", e200, 210)]
+    nexts, xmarks = [], []
+    for na, a, nb, b, st0 in pairs:
+        r = cross_report(c, a, b, st0, sec, na, nb)
+        name = f"{na}/{nb.replace('EMA ', '')}" if na != "Price" else "Price/EMA 200"
+        tagline = {"EMA 50/200": " (Golden/Death cross)"}.get(name, "")
+        h += f"<b>🔀 {name}{tagline}</b>\n"
+        h += f"  Now: {na} is <b>{'ABOVE ⬆️' if r['above'] else 'BELOW ⬇️'}</b> {nb}\n"
+        if r["last"]:
+            kind, ts, i = r["last"]
+            ago = c[-1]["t"] + sec - ts
+            h += (f"  Last cross: {'🟢' if kind == 'BULLISH' else '🔴'} {kind} at "
+                  f"<b>{_when(ts)}</b> ({_dur(ago)} ago)\n")
+            if name in ("EMA 20/50", "EMA 50/200"):
+                xmarks.append((i, a[i], f"{'▲' if kind == 'BULLISH' else '▼'} {name}",
+                               UP if kind == "BULLISH" else DN))
+        else:
+            h += "  Last cross: none in loaded history\n"
+        if r["next"]:
+            kind, ts, bars = r["next"]
+            h += (f"  Next cross: {'🟢' if kind == 'BULLISH' else '🔴'} possible {kind} around "
+                  f"<b>{_when(ts)}</b> (in ~{_dur(ts - (c[-1]['t'] + sec))}) ⏳\n")
+            nexts.append((ts, kind, name))
+        else:
+            h += "  Next cross: not expected soon (lines moving apart)\n"
+    if nexts:
+        ts, kind, name = min(nexts)
+        act = (f"WATCH {name} - POSSIBLE {kind} CROSS AROUND "
+               f"{datetime.fromtimestamp(ts, DXB).strftime('%I:%M %p').lstrip('0')} - "
+               f"WAIT FOR CANDLE CLOSE TO CONFIRM")
+    else:
+        act = ("TREND IS STABLE - NO CROSS EXPECTED SOON - TRADE WITH THE TREND"
+               if "Sideways" not in lab else "NO CLEAR TREND - WAIT")
+    h += (f"━━━━━━━━━━━━━━\n▶️ <b>NEXT ACTION: {act}</b>\n"
+          f"<i>Next cross time is an estimate from current EMA speed - it can change.</i>")
+    ch = chart_data(c, f"{sym} · {tf} · EMA CROSS")
+    ch["xmarks"] = xmarks
+    ch["ema_only"] = True
+    ch["action"] = (act, "#ffd400")
+    return {"html": h + FOOT, "chart": ch, "static": True}
 
 def cmd_fvg(args):
     sym, tf = parse_args(args)
@@ -1672,7 +1804,7 @@ def cmd_help(args):
          "💧 /liq — Liquidity (PDH/PDL, EQH/EQL, Asia range)\n"
          "⚖️ /pd — Premium / Discount + OTE\n"
          "📊 /trend — trend from 5m to 1D + bias\n"
-         "📈 /ema — EMA 20/50/200\n"
+         "📈 /ema — EMA cross report (last + next cross time)\n"
          "📉 /chart — live chart\n"
          "💰 /price — BTC + Gold price\n"
          "🕒 /session — Tokyo / London / NY\n"
@@ -1690,7 +1822,7 @@ COMMANDS = {"smc": cmd_smc, "fvg": cmd_fvg, "ob": cmd_ob, "bos": cmd_bos, "choch
 
 MENU = [("smc", "SMC full report"), ("fvg", "Fair Value Gaps"), ("ob", "Order Blocks"),
         ("bos", "BOS / CHoCH"), ("liq", "Liquidity levels"), ("pd", "Premium / Discount"),
-        ("trend", "Multi-timeframe trend"), ("ema", "EMA 20/50/200"), ("chart", "Live chart"),
+        ("trend", "Multi-timeframe trend"), ("ema", "EMA cross report"), ("chart", "Live chart"),
         ("price", "BTC + Gold price"), ("session", "Sessions"), ("trades", "Open trades"),
         ("stats", "Today's results"), ("status", "Bot status"), ("help", "All commands")]
 
