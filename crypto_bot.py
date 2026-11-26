@@ -316,7 +316,7 @@ def make_chart(d):
     from matplotlib.colors import LinearSegmentedColormap
     full = d.get("full") or d["c"]
     N = len(full)
-    n = min(len(d["c"]), 55)
+    n = min(N, d.get("n", 55))
     off = N - n
     c = full[off:]
     G_UP, G_DN = "#8fe36b", "#e5484d"
@@ -330,7 +330,7 @@ def make_chart(d):
     action = d.get("action")
     ax = fig.add_axes([0.04, 0.22, 0.80, 0.61] if action else [0.04, 0.09, 0.80, 0.74])
     ax.patch.set_alpha(0)
-    RX = n + 27  # right side labels ki jagah
+    RX = n + (27 if d.get("levels") else 4)  # right side labels ki jagah
 
     # ---- SMC data pehle nikaalo (taaki y-range me zones bhi aayein) ----
     px = c[-1]["c"]
@@ -377,6 +377,9 @@ def make_chart(d):
     for z in smc["fvg"] + smc["ob"]:
         ys += [z["lo"], z["hi"]]
     ys += [v for _, v in smc["eqh"] + smc["eql"]]
+    for _, blo, bhi, _, _ in d.get("boxes", []):  # command wale zones hamesha chart me
+        ys += [blo, bhi]
+    ys += [y for y, _, _ in d.get("hlines", [])]
     lo_y, hi_y = min(ys), max(ys)
     if "e200" in emas:  # EMA 200 bahut door na ho to range me lo
         e2 = emas["e200"]
@@ -468,7 +471,8 @@ def make_chart(d):
             x0, x1 = max(si - off, 0), i - off
             col = "#b6f09c" if kind == "BOS" else "#7dff7a"
             ax.hlines(lvl, x0, x1, color=col, linewidth=1.3, zorder=5)
-            sub = "(Break of Structure)" if kind == "BOS" else "(Change of Character)"
+            sub = ("(Break of Structure)" if kind == "BOS" else "(Change of Character)") + \
+                  f" {lvl:,.2f}"
             put((x0 + x1) / 2, lvl - (pad * 0.08 if side == "bull" else -pad * 0.08),
                 f"{kind}\n{sub}", fs=7.5, color=col if kind == "CHoCH" else "white",
                 ha="center", va="top" if side == "bull" else "bottom", fontweight="bold",
@@ -476,57 +480,76 @@ def make_chart(d):
         shown.append(f"BOS/CHoCH {nb}" if nb else "BOS/CHoCH: none recent")
         # FVG boxes (purane bhi, agar abhi tak fill nahi hue)
         callout_done = d.get("no_callout", False)
+        callout_req = None
         for f in smc["fvg"]:
             col = "#5fd35f" if f["side"] == "bull" else "#ff6b6b"
             x0 = max(f["i"] - off - 0.5, -0.5)
             ax.add_patch(Rectangle((x0, f["lo"]), n - x0 - 0.5, f["hi"] - f["lo"], facecolor=col,
                                    alpha=0.22, edgecolor=col, linewidth=0.9, zorder=1))
-            tag = "Bullish FVG" if f["side"] == "bull" else "Bearish FVG"
-            put(max(x0, 0) + 0.4, (f["lo"] + f["hi"]) / 2, tag, fs=7.5, color=col, ha="left",
+            tag = (("Bullish FVG" if f["side"] == "bull" else "Bearish FVG") +
+                   f"  {f['lo']:,.2f}-{f['hi']:,.2f} · "
+                   f"{datetime.fromtimestamp(full[f['i']]['t'], DXB).strftime('%d %b %H:%M')}")
+            if f["i"] >= off:  # FVG kis candle pe bana: marker
+                ax.vlines(f["i"] - off, f["lo"], f["hi"], color=col, linewidth=3, zorder=5)
+            flx, fha = (max(x0, 0) + 0.4, "left") if x0 < n * 0.45 else (x0 - 0.3, "right")
+            put(flx, (f["lo"] + f["hi"]) / 2, tag, fs=7.5, color=col, ha=fha,
                 va="center", fontweight="bold", zorder=7,
                 bbox=dict(boxstyle="round,pad=0.15", fc="#0d2418", ec="none", alpha=0.85))
             if not callout_done:
                 callout_done = True
-                yl, yh = ax.get_ylim()
-                best = None
-                for cx in (n * 0.2, n * 0.4, n * 0.6):
-                    for cy in (yh - (yh - yl) * 0.12, yl + (yh - yl) * 0.12,
-                               (f["lo"] + f["hi"]) / 2 + (yh - yl) * 0.25,
-                               (f["lo"] + f["hi"]) / 2 - (yh - yl) * 0.25):
-                        if not (yl < cy < yh):
-                            continue
-                        band = (yh - yl) * 0.08
-                        hit = sum(1 for j, x in enumerate(c) if abs(j - cx) < 7
-                                  and x["l"] < cy + band and x["h"] > cy - band)
-                        score = (hit * 10 + abs(cx - (x0 + 2)) * 0.3
-                                 + abs(cy - (f["lo"] + f["hi"]) / 2) / (yh - yl) * 25)
-                        if best is None or score < best[0]:
-                            best = (score, cx, cy)
-                if best:
-                    ax.annotate("Fair Value Gap (FVG)\nInefficiency Zone - price\nlikely to return to fill",
-                                xy=(max(x0, 0) + 1.5, (f["lo"] + f["hi"]) / 2), xytext=(best[1], best[2]),
-                                color="white", fontsize=7.5, ha="center", va="center", zorder=8,
-                                bbox=dict(boxstyle="round,pad=0.45", fc="#0d2418", ec=col, lw=1.2),
-                                arrowprops=dict(arrowstyle="-", color=col, lw=1))
+                callout_req = (f, x0, col)
         if not d.get("no_auto_fvg"):
             shown.append(f"FVG {len(smc['fvg'])}" if smc["fvg"] else "FVG: none open near price")
         # Order Blocks (bullish + bearish dono)
         for ob in smc["ob"]:
             x0 = max(ob["i"] - off - 0.6, -0.6)
             col = "#5fd35f" if ob["side"] == "bull" else "#ff9f1c"
-            w = n - x0 - 0.4
+            w = n - x0 - 0.4  # OB candle se right edge tak
             ax.add_patch(FancyBboxPatch((x0, ob["lo"]), w, ob["hi"] - ob["lo"],
                                         boxstyle="round,pad=0,rounding_size=0.6",
                                         facecolor=col, alpha=0.14, edgecolor=col, lw=1.6, zorder=1))
-            put(n * 0.55, (ob["lo"] + ob["hi"]) / 2,
-                "Bullish Order Block" if ob["side"] == "bull" else "Bearish Order Block",
-                fs=8, color="white", ha="center", va="center", fontweight="bold", zorder=7,
+            if ob["i"] >= off:  # OB candle marker
+                ax.vlines(ob["i"] - off, ob["lo"], ob["hi"], color=col, linewidth=3, zorder=5)
+            olx, oha = (max(x0, 0) + 0.8, "left") if x0 < n * 0.45 else (x0 - 0.3, "right")
+            put(olx, (ob["lo"] + ob["hi"]) / 2,
+                ("Bullish Order Block" if ob["side"] == "bull" else "Bearish Order Block") +
+                f"  {ob['lo']:,.2f}-{ob['hi']:,.2f} · "
+                f"{datetime.fromtimestamp(full[ob['i']]['t'], DXB).strftime('%d %b %H:%M')}",
+                fs=8, color="white", ha=oha, va="center", fontweight="bold", zorder=7,
                 bbox=dict(boxstyle="round,pad=0.2", fc="#0d2418", ec=col, alpha=0.95))
         if not d.get("no_auto_ob"):
             shown.append(f"OB {len(smc['ob'])}" if smc["ob"] else "OB: none valid near price")
+        if callout_req:  # FVG callout sabse aakhir me (labels ke baad, khali jagah pe)
+            f, x0, col = callout_req
+            yl, yh = ax.get_ylim()
+            best = None
+            for cx in (n * 0.15, n * 0.3, n * 0.45, n * 0.6, n * 0.75):
+                for cy in [yl + (yh - yl) * k_ for k_ in (0.1, 0.25, 0.4, 0.55, 0.7, 0.85)]:
+                    if not (yl < cy < yh):
+                        continue
+                    band = (yh - yl) * 0.08
+                    hit = sum(1 for j, x in enumerate(c) if abs(j - cx) < 7
+                              and x["l"] < cy + band and x["h"] > cy - band)
+                    cw_ = 26 * 7.5 * 0.0085 / axw_in * (RX + 1)
+                    ch_ = 3 * 7.5 * 0.0185 / axh_in * (yh0 - yl0) * 1.3
+                    clash = sum(1 for b_ in placed if not (cx + cw_ / 2 < b_[0] or cx - cw_ / 2 > b_[2]
+                                                           or cy + ch_ / 2 < b_[1] or cy - ch_ / 2 > b_[3]))
+                    score = (hit * 10 + clash * 40 + abs(cx - (x0 + 2)) * 0.3
+                             + abs(cy - (f["lo"] + f["hi"]) / 2) / (yh - yl) * 25)
+                    if best is None or score < best[0]:
+                        best = (score, cx, cy, clash)
+            if best and best[3] == 0:  # khali jagah mili tabhi callout
+                cw = 26 * 7.5 * 0.0085 / axw_in * (RX + 1)
+                chh = 3 * 7.5 * 0.0185 / axh_in * (yh0 - yl0) * 1.3
+                placed.append((best[1] - cw / 2, best[2] - chh / 2, best[1] + cw / 2, best[2] + chh / 2))
+                ax.annotate("Fair Value Gap (FVG)\nInefficiency Zone - price\nlikely to return to fill",
+                            xy=(max(x0, 0) + 1.5, (f["lo"] + f["hi"]) / 2), xytext=(best[1], best[2]),
+                            color="white", fontsize=7.5, ha="center", va="center", zorder=8,
+                            bbox=dict(boxstyle="round,pad=0.45", fc="#0d2418", ec=col, lw=1.2),
+                            arrowprops=dict(arrowstyle="-", color=col, lw=1))
         # Liquidity: equal highs / lows
-        for (_, v), lab, col in [(z, "$$$ EQH - Buy-side Liquidity", "#ff8a8a") for z in smc["eqh"]] + \
-                                [(z, "$$$ EQL - Sell-side Liquidity", "#8fe36b") for z in smc["eql"]]:
+        for (_, v), lab, col in [(z, f"$$$ EQH - Buy-side Liquidity {z[1]:,.2f}", "#ff8a8a") for z in smc["eqh"]] + \
+                                [(z, f"$$$ EQL - Sell-side Liquidity {z[1]:,.2f}", "#8fe36b") for z in smc["eql"]]:
             ax.hlines(v, -0.5, n, color=col, linewidth=1, linestyle="-.", alpha=0.9, zorder=2)
             put(n * 0.3, v, lab, fs=7.5, color=col, ha="center", va="bottom",
                 fontweight="bold", zorder=6)
@@ -544,12 +567,23 @@ def make_chart(d):
 
     # ---- extra boxes / lines (commands se) ----
     for i0, blo, bhi, bcol, blab in d.get("boxes", []):
-        x0 = max(i0 - (len(d["c"]) - n), -0.5)
-        ax.add_patch(Rectangle((x0, blo), n - x0, bhi - blo, color=bcol, alpha=0.18, lw=0, zorder=1))
-        ax.text(x0 + 0.3, bhi, blab, color=bcol, fontsize=7.5, va="bottom", fontweight="bold")
+        x0 = max(i0 + (N - len(d["c"])) - off - 0.5, -0.6)
+        ax.add_patch(FancyBboxPatch((x0, blo), n - x0 - 0.4, bhi - blo,
+                                    boxstyle="round,pad=0,rounding_size=0.5",
+                                    facecolor=bcol, alpha=0.20, edgecolor=bcol, lw=1.6, zorder=1))
+        if i0 + (N - len(d["c"])) - off >= 0:  # zone kis candle se bana: marker
+            ax.vlines(x0 + 0.5, blo, bhi, color=bcol, linewidth=3, zorder=5)
+        lx, lha = (max(x0, 0) + 0.8, "left") if x0 < n * 0.45 else (n - 0.5, "right")
+        r = put(lx, (blo + bhi) / 2, blab, fs=7.8, color="white", ha=lha, va="center",
+                fontweight="bold", zorder=8,
+                bbox=dict(boxstyle="round,pad=0.25", fc="#0d2418", ec=bcol, alpha=0.95))
+        if r is None:  # jagah na mile to bhi label zaroor
+            ax.text(lx, (blo + bhi) / 2, blab, fontsize=7.8, color="white", ha=lha,
+                    va="center", fontweight="bold", zorder=8,
+                    bbox=dict(boxstyle="round,pad=0.25", fc="#0d2418", ec=bcol, alpha=0.95))
     for y, ylab, ycol in d.get("hlines", []):
         ax.hlines(y, -0.5, n, color=ycol, linewidth=1, linestyle="-.", alpha=0.9, zorder=2)
-        ax.text(0, y, f" {ylab}", color=ycol, fontsize=7.5, va="bottom", fontweight="bold")
+        put(0.5, y, ylab, fs=7.5, color=ycol, ha="left", va="bottom", fontweight="bold", zorder=6)
 
     # ---- Entry / SL / TP: arrows + labels (right side) ----
     names = {"ENTRY": "Potential Entry", "SL": "Stop Loss", "TP1": "TP1",
@@ -586,6 +620,10 @@ def make_chart(d):
     ax.spines["right"].set_color("#8a9a90")
     ax.spines["right"].set_position(("data", RX))
     ax.axhline(c[-1]["c"], xmax=(n + 1) / (RX + 1), color="#8a9a90", lw=0.7, ls=":", zorder=1)
+    lcol = "#0ecb81" if c[-1]["c"] >= c[-1]["o"] else "#f6465d"  # live price tag (exchange jaisa)
+    ax.text(RX + 0.2, c[-1]["c"], f" {c[-1]['c']:,.2f} ", color="white", fontsize=8.5,
+            fontweight="bold", va="center", ha="left", clip_on=False, zorder=10,
+            bbox=dict(boxstyle="square,pad=0.3", fc=lcol, ec="none"))
     step = max(1, n // 8)
     ticks = list(range(0, n, step))
     ax.set_xticks(ticks)
@@ -1424,6 +1462,7 @@ def smc_pack(sym, tf):
 
 def chart_for(c, title, n=80, boxes=(), marks=(), hlines=(), segs=()):
     d = chart_data(c, title, n=n)
+    d["n"] = 80
     off = len(c) - n
     d["segs"] = [(a - off, b - off, y, t, col) for a, b, y, t, col in segs]
     d["boxes"] = [(i - off, lo, hi, col, lab) for i, lo, hi, col, lab in boxes]
@@ -1581,6 +1620,9 @@ def cmd_ema(args):
     ch["action"] = (act, "#ffd400")
     return {"html": h + FOOT, "chart": ch, "static": True}
 
+def _ts(c, i):
+    return datetime.fromtimestamp(c[i]["t"], DXB).strftime("%d %b %H:%M")
+
 def cmd_fvg(args):
     sym, tf = parse_args(args)
     c, atr, *_ = smc_pack(sym, tf)
@@ -1590,16 +1632,22 @@ def cmd_fvg(args):
     bear = sorted([f for f in fv if f["side"] == "bear"], key=lambda f: f["lo"] - p)[:3]
     h = head(sym, tf, "🕳 Fair Value Gaps (unfilled)")
     h += "🟢 <b>Bullish FVG</b> (support, below price):\n"
-    h += "".join(f"  • <code>{f['lo']:.2f} - {f['hi']:.2f}</code>  ({f['fill'] * 100:.0f}% filled)\n"
-                 for f in bull) or "  none\n"
+    h += "".join(f"  • <code>{f['lo']:.2f} - {f['hi']:.2f}</code>  ({f['fill'] * 100:.0f}% filled)"
+                 f"  🕒 {_ts(c, f['i'])}\n" for f in bull) or "  none\n"
     h += "🔴 <b>Bearish FVG</b> (resistance, above price):\n"
-    h += "".join(f"  • <code>{f['lo']:.2f} - {f['hi']:.2f}</code>  ({f['fill'] * 100:.0f}% filled)\n"
-                 for f in bear) or "  none\n"
-    h += f"Price: <code>{p:.2f}</code>"
-    boxes = [(f["i"], f["lo"], f["hi"], UP if f["side"] == "bull" else DN, "FVG")
-             for f in bull + bear if f["i"] >= len(c) - 80]
-    ch = chart_for(c, f"{sym} · {tf} · FVG", boxes=boxes)
+    h += "".join(f"  • <code>{f['lo']:.2f} - {f['hi']:.2f}</code>  ({f['fill'] * 100:.0f}% filled)"
+                 f"  🕒 {_ts(c, f['i'])}\n" for f in bear) or "  none\n"
+    h += f"Price: <code>{p:.2f}</code>\n<i>🕒 = time the zone formed (Dubai)</i>"
+    off80 = len(c) - 80
+    boxes = [(f["i"] - off80, f["lo"], f["hi"], UP if f["side"] == "bull" else DN,
+              f"{'Bullish' if f['side'] == 'bull' else 'Bearish'} FVG  {f['lo']:,.2f}-{f['hi']:,.2f}"
+              f"  · {_ts(c, f['i'])}") for f in bull + bear]
+    ch = chart_for(c, f"{sym} · {tf} · Fair Value Gaps", boxes=[])
+    ch["boxes"] = boxes
+    ch["n"] = max(60, min(150, len(c) - min([f["i"] for f in bull + bear], default=len(c)) + 6))
     ch["no_auto_fvg"] = True
+    ch["no_auto_ob"] = True
+    ch["no_callout"] = True
     return {"html": h + FOOT, "static": True, "chart": ch}
 
 def cmd_ob(args):
@@ -1611,14 +1659,21 @@ def cmd_ob(args):
     bear = sorted([o for o in obs if o["side"] == "bear"], key=lambda o: o["lo"] - p)[:3]
     h = head(sym, tf, "🧱 Order Blocks (unmitigated)")
     h += "🟢 <b>Bullish OB</b> (demand):\n"
-    h += "".join(f"  • <code>{o['lo']:.2f} - {o['hi']:.2f}</code>\n" for o in bull) or "  none\n"
+    h += "".join(f"  • <code>{o['lo']:.2f} - {o['hi']:.2f}</code>  🕒 {_ts(c, o['i'])}"
+                 f"{'  (tested)' if o.get('tested') else '  (fresh)'}\n" for o in bull) or "  none\n"
     h += "🔴 <b>Bearish OB</b> (supply):\n"
-    h += "".join(f"  • <code>{o['lo']:.2f} - {o['hi']:.2f}</code>\n" for o in bear) or "  none\n"
-    h += f"Price: <code>{p:.2f}</code>"
-    boxes = [(o["i"], o["lo"], o["hi"], "#3d7dff" if o["side"] == "bull" else "#ff9f1c", "OB")
-             for o in bull + bear if o["i"] >= len(c) - 80]
-    ch = chart_for(c, f"{sym} · {tf} · Order Blocks", boxes=boxes)
+    h += "".join(f"  • <code>{o['lo']:.2f} - {o['hi']:.2f}</code>  🕒 {_ts(c, o['i'])}"
+                 f"{'  (tested)' if o.get('tested') else '  (fresh)'}\n" for o in bear) or "  none\n"
+    h += f"Price: <code>{p:.2f}</code>\n<i>🕒 = time the OB candle formed (Dubai)</i>"
+    off80 = len(c) - 80
+    boxes = [(o["i"] - off80, o["lo"], o["hi"], "#5fd35f" if o["side"] == "bull" else "#ff9f1c",
+              f"{'Bullish' if o['side'] == 'bull' else 'Bearish'} Order Block  "
+              f"{o['lo']:,.2f}-{o['hi']:,.2f}  · {_ts(c, o['i'])}") for o in bull + bear]
+    ch = chart_for(c, f"{sym} · {tf} · Order Blocks", boxes=[])
+    ch["boxes"] = boxes
+    ch["n"] = max(60, min(150, len(c) - min([o["i"] for o in bull + bear], default=len(c)) + 6))
     ch["no_auto_ob"] = True
+    ch["no_auto_fvg"] = True
     return {"html": h + FOOT, "static": True, "chart": ch}
 
 def cmd_bos(args):
@@ -1757,7 +1812,7 @@ def cmd_smc(args):
     segs = [(si, i, lvl, kind, UP if side == "bull" else DN) for i, side, kind, lvl, si in ev[-4:]]
     hl = [(v, "EQH", "#f6465d") for _, v in eqh[-1:]] + [(v, "EQL", "#0ecb81") for _, v in eql[-1:]]
     return {"html": h + FOOT, "static": True,
-            "chart": dict(chart_for(c, f"{sym} · {tf} · SMC", hlines=hl),
+            "chart": dict(chart_for(c, f"{sym} · {tf} · SMC"),
                           action=(idea[2:], "#0ecb81" if "BUY" in idea else
                                   "#e5484d" if "SELL" in idea else "#848e9c"))}
 
