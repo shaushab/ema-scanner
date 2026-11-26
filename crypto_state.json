@@ -13,7 +13,7 @@
    ],
    "hit": 2,
    "filled": true,
-   "chk": 1795714920,
+   "chk": 1795735680,
    "expire": 1795549500
   },
   {
@@ -29,7 +29,7 @@
    ],
    "hit": 1,
    "filled": true,
-   "chk": 1795714920,
+   "chk": 1795735680,
    "expire": 1795640400
   },
   {
@@ -45,7 +45,7 @@
    ],
    "hit": 1,
    "filled": true,
-   "chk": 1795714920,
+   "chk": 1795735680,
    "expire": 1795644900
   },
   {
@@ -61,79 +61,61 @@
    ],
    "hit": 0,
    "filled": true,
-   "chk": 1795714920,
+   "chk": 1795735680,
    "expire": 1795665600
   },
   {
    "sym": "BTCUSDT",
    "tf": "15",
-   "side": "SELL",
-   "entry": 60536.0,
-   "sl": 60861.025,
+   "side": "BUY",
+   "entry": 60708.2,
+   "sl": 60339.50428571428,
    "tps": [
-    60210.975,
-    59885.95,
-    59560.924999999996
+    61076.89571428571,
+    61445.591428571424,
+    61814.28714285714
    ],
    "hit": 0,
    "filled": true,
-   "chk": 1795714920,
-   "expire": 1795722300
+   "chk": 1795735680,
+   "expire": 1795733100
   }
  ],
- "day": "2026-11-26",
+ "day": "2026-11-27",
  "stats": {
   "XAUUSDT 15m": {
    "signals": 1,
    "filled": 1,
-   "tp1": 1,
-   "tp2": 0,
-   "tp3": 0,
-   "sl": 1,
-   "cancel": 0
-  },
-  "BTCUSDT 1m": {
-   "signals": 7,
-   "filled": 7,
-   "tp1": 4,
-   "tp2": 2,
-   "tp3": 2,
-   "sl": 4,
-   "cancel": 0
-  },
-  "BTCUSDT 5m": {
-   "signals": 0,
-   "filled": 0,
    "tp1": 0,
    "tp2": 0,
-   "tp3": 1,
-   "sl": 0,
+   "tp3": 0,
+   "sl": 2,
    "cancel": 0
   },
   "BTCUSDT 15m": {
-   "signals": 3,
-   "filled": 3,
+   "signals": 1,
+   "filled": 1,
+   "tp1": 0,
+   "tp2": 0,
+   "tp3": 0,
+   "sl": 1,
+   "cancel": 0
+  },
+  "XAUUSDT 5m": {
+   "signals": 2,
+   "filled": 2,
    "tp1": 1,
    "tp2": 0,
    "tp3": 0,
    "sl": 1,
    "cancel": 0
   },
-  "XAUUSDT 1m": {
-   "signals": 8,
-   "filled": 8,
-   "tp1": 5,
-   "tp2": 3,
-   "tp3": 0,
-   "sl": 3,
-   "cancel": 0
-  },
-  "XAUUSDT 5m": {
+  "BTCUSDT 5m": {
    "signals": 1,
    "filled": 1,
    "tp1": 1,
-   "tp2": 0,
-   "tp3": 0,
+   "tp2": 1,
+   "tp3": 1,
    "sl": 0,
    "cancel": 0
   }
@@ -152,14 +134,23 @@
   "London|2026-11-26|open",
   "Tokyo|2026-11-26|close",
   "New York|2026-11-26|open",
-  "London|2026-11-26|close"
+  "London|2026-11-26|close",
+  "New York|2026-11-26|close"
  ],
  "last": {
-  "BTCUSDT|15": 1795713300,
-  "BTCUSDT|5": 1795714500,
-  "BTCUSDT|1": 1795714920,
-  "XAUUSDT|15": 1795713300,
-  "XAUUSDT|5": 1795714500,
-  "XAUUSDT|1": 1795714920
+  "BTCUSDT|15": 1795734000,
+  "BTCUSDT|5": 1795735200,
+  "BTCUSDT|1": 1795735680,
+  "XAUUSDT|15": 1795734000,
+  "XAUUSDT|5": 1795735200,
+  "XAUUSDT|1": 1795735680
+ },
+ "choch_seen": {
+  "BTCUSDT|5": 1795735200,
+  "BTCUSDT|15": 1795734000,
+  "XAUUSDT|5": 1795735200,
+  "XAUUSDT|15": 1795734000,
+  "ETHUSDT|5": 1795735200,
+  "ETHUSDT|15": 1795734000
  }
 }
