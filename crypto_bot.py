@@ -328,12 +328,39 @@ def make_chart(d):
     bgx.imshow([[0], [0.5], [1]], aspect="auto", cmap=cmap, extent=[0, 1, 0, 1],
                interpolation="bicubic")
     action = d.get("action")
-    ax = fig.add_axes([0.04, 0.20, 0.80, 0.63] if action else [0.04, 0.09, 0.80, 0.74])
+    ax = fig.add_axes([0.04, 0.22, 0.80, 0.61] if action else [0.04, 0.09, 0.80, 0.74])
     ax.patch.set_alpha(0)
     RX = n + 27  # right side labels ki jagah
 
-    # ---- y limits (EMA + levels + boxes bhi) ----
-    ys = [x["h"] for x in c] + [x["l"] for x in c]
+    # ---- SMC data pehle nikaalo (taaki y-range me zones bhi aayein) ----
+    px = c[-1]["c"]
+    cand_lo = min(x["l"] for x in c)
+    cand_hi = max(x["h"] for x in c)
+    span = (cand_hi - cand_lo) or 1
+    near = lambda lo_, hi_: lo_ > cand_lo - span * 0.8 and hi_ < cand_hi + span * 0.8
+    smc = {"ev": [], "hs": [], "ls": [], "fvg": [], "ob": [], "eqh": [], "eql": []}
+    try:
+        atr = atr_list(full)
+        trend, ev, hs, ls = structure(full)
+        smc.update(ev=ev, hs=hs, ls=ls)
+        if not d.get("no_auto_fvg"):
+            fv = [f for f in fvgs(full, atr) if near(f["lo"], f["hi"])]
+            bull = sorted([f for f in fv if f["side"] == "bull"], key=lambda f: abs(px - f["hi"]))[:1]
+            bear = sorted([f for f in fv if f["side"] == "bear"], key=lambda f: abs(f["lo"] - px))[:1]
+            smc["fvg"] = bull + bear
+        if not d.get("no_auto_ob"):
+            obs = [o for o in order_blocks(full, atr) if near(o["lo"], o["hi"])]
+            ob_b = min([o for o in obs if o["side"] == "bull"], key=lambda o: abs(px - o["hi"]), default=None)
+            ob_s = min([o for o in obs if o["side"] == "bear"], key=lambda o: abs(o["lo"] - px), default=None)
+            smc["ob"] = [o for o in (ob_b, ob_s) if o]
+        eqh, eql = liquidity(full, hs, ls, atr)
+        smc["eqh"] = [v for v in eqh if near(v[1], v[1])][-1:]
+        smc["eql"] = [v for v in eql if near(v[1], v[1])][-1:]
+    except Exception as ex:
+        print("smc calc error:", ex, flush=True)
+
+    # ---- y limits (candles + EMA + levels + zones) ----
+    ys = [cand_lo, cand_hi]
     emas = {}
     cl = [x["c"] for x in full]
     for key, per in (("e20", 20), ("e50", 50), ("e200", 200)):
@@ -343,8 +370,11 @@ def make_chart(d):
         if key in emas:
             ys += emas[key]
     ys += [p for p, _, _ in d.get("levels", [])]
+    for z in smc["fvg"] + smc["ob"]:
+        ys += [z["lo"], z["hi"]]
+    ys += [v for _, v in smc["eqh"] + smc["eql"]]
     lo_y, hi_y = min(ys), max(ys)
-    if "e200" in emas:  # EMA 200 bahut door ho to edge pe tag
+    if "e200" in emas:  # EMA 200 bahut door na ho to range me lo
         e2 = emas["e200"]
         if min(e2) > lo_y - (hi_y - lo_y) * 0.6 and max(e2) < hi_y + (hi_y - lo_y) * 0.6:
             lo_y, hi_y = min(lo_y, min(e2)), max(hi_y, max(e2))
@@ -366,10 +396,34 @@ def make_chart(d):
         if key in emas:
             ax.plot(range(n), emas[key], color=col, linewidth=1.5, alpha=0.9, zorder=2, label=lab)
 
-    # ---- SMC overlay ----
+    # ---- Equilibrium (range ka 50%) ----
+    eqp = (cand_lo + cand_hi) / 2
+    ax.hlines(eqp, -0.5, n, color="#9fb5a8", linewidth=0.8, linestyle=(0, (2, 4)), alpha=0.6, zorder=1)
+
+    # ---- label placer: labels ek dusre pe na chadhein ----
+    yl0, yh0 = ax.get_ylim()
+    axw_in = 8.0
+    axh_in = 7.4 * (0.61 if action else 0.74)
+    placed = []
+
+    def put(x, y, text, fs=8, ha="center", va="center", **kw):
+        lines_ = text.split("\n")
+        w = max(len(t_) for t_ in lines_) * fs * 0.0085 / axw_in * (RX + 1)
+        h = len(lines_) * fs * 0.0185 / axh_in * (yh0 - yl0)
+        x0_ = x - w / 2 if ha == "center" else (x if ha == "left" else x - w)
+        y0_ = y - h / 2 if va == "center" else (y if va == "bottom" else y - h)
+        for dy in (0, h * 1.1, -h * 1.1, h * 2.2, -h * 2.2, h * 3.3, -h * 3.3):
+            box = (x0_, y0_ + dy, x0_ + w, y0_ + dy + h)
+            if all(box[2] < b_[0] or box[0] > b_[2] or box[3] < b_[1] or box[1] > b_[3]
+                   for b_ in placed):
+                placed.append(box)
+                return ax.text(x, y + dy, text, fontsize=fs, ha=ha, va=va, **kw)
+        return None  # jagah nahi mili to label skip
+
+    # ---- SMC overlay drawing ----
+    shown = []
     try:
-        atr = atr_list(full)
-        trend, ev, hs, ls = structure(full)
+        ev, hs, ls = smc["ev"], smc["hs"], smc["ls"]
         # swing labels: Higher High / Lower High / Higher Low / Lower Low
         prev = None
         labs = []
@@ -383,73 +437,92 @@ def make_chart(d):
                 labs.append((i, p, "Higher Low" if p > prev else "Lower Low", "bot"))
             prev = p
         labs.sort(key=lambda z: z[0])
-        for i, p, t, pos in labs[-7:]:
+        for i, p, t, pos in labs[-6:]:
             dy = pad * 0.35
-            ax.text(i - off, p + dy if pos == "top" else p - dy, t, color="white", fontsize=8.5,
-                    ha="center", va="bottom" if pos == "top" else "top", fontweight="bold", zorder=6)
+            put(i - off, p + dy if pos == "top" else p - dy, t, fs=8.5, color="white",
+                ha="center", va="bottom" if pos == "top" else "top", fontweight="bold", zorder=6)
+        if labs:
+            shown.append("HH/HL/LH/LL")
         # BOS / CHoCH lines
+        nb = 0
         for i, side, kind, lvl, si in ev[-3:]:
             if i < off:
                 continue
+            nb += 1
             x0, x1 = max(si - off, 0), i - off
             col = "#b6f09c" if kind == "BOS" else "#7dff7a"
             ax.hlines(lvl, x0, x1, color=col, linewidth=1.3, zorder=5)
             sub = "(Break of Structure)" if kind == "BOS" else "(Change of Character)"
-            # swing label line ke upar/neeche hota hai, BOS label ulti taraf
-            ax.text((x0 + x1) / 2, lvl - (pad * 0.08 if side == "bull" else -pad * 0.08),
-                    f"{kind}\n{sub}", color=col if kind == "CHoCH" else "white", fontsize=7.5,
-                    ha="center", va="top" if side == "bull" else "bottom", fontweight="bold",
-                    linespacing=1.1, zorder=6)
-        px = c[-1]["c"]
-        # nearest FVG (window me)
-        fv = [f for f in fvgs(full, atr) if f["i"] >= off]
-        fb = min([f for f in fv if f["side"] == "bull"], key=lambda f: abs(px - f["hi"]), default=None)
-        fs = min([f for f in fv if f["side"] == "bear"], key=lambda f: abs(f["lo"] - px), default=None)
-        for f in (fb, fs):
-            if not f or d.get("no_auto_fvg"):
-                continue
-            x0 = f["i"] - off - 0.5
+            put((x0 + x1) / 2, lvl - (pad * 0.08 if side == "bull" else -pad * 0.08),
+                f"{kind}\n{sub}", fs=7.5, color=col if kind == "CHoCH" else "white",
+                ha="center", va="top" if side == "bull" else "bottom", fontweight="bold",
+                linespacing=1.1, zorder=6)
+        shown.append(f"BOS/CHoCH {nb}" if nb else "BOS/CHoCH: none recent")
+        # FVG boxes (purane bhi, agar abhi tak fill nahi hue)
+        callout_done = d.get("no_callout", False)
+        for f in smc["fvg"]:
             col = "#5fd35f" if f["side"] == "bull" else "#ff6b6b"
+            x0 = max(f["i"] - off - 0.5, -0.5)
             ax.add_patch(Rectangle((x0, f["lo"]), n - x0 - 0.5, f["hi"] - f["lo"], facecolor=col,
-                                   alpha=0.22, edgecolor=col, linewidth=0.8, zorder=1))
-            # callout khali jagah pe: kam candles wali position chuno
-            yl, yh = ax.get_ylim()
-            best = None
-            for cx in (n * 0.2, n * 0.4, n * 0.6):
-                for cy in (yh - (yh - yl) * 0.12, yl + (yh - yl) * 0.12,
-                           (f["lo"] + f["hi"]) / 2 + (yh - yl) * 0.25,
-                           (f["lo"] + f["hi"]) / 2 - (yh - yl) * 0.25):
-                    if not (yl < cy < yh):
-                        continue
-                    band = (yh - yl) * 0.08
-                    hit = sum(1 for j, x in enumerate(c) if abs(j - cx) < 7
-                              and x["l"] < cy + band and x["h"] > cy - band)
-                    score = (hit * 10 + abs(cx - (x0 + 2)) * 0.3
-                             + abs(cy - (f["lo"] + f["hi"]) / 2) / (yh - yl) * 25)
-                    if best is None or score < best[0]:
-                        best = (score, cx, cy)
-            tx, ty = best[1], best[2]
-            ax.annotate("Fair Value Gap (FVG)\nInefficiency Zone - price\nlikely to return to fill",
-                        xy=(x0 + 1.5, (f["lo"] + f["hi"]) / 2), xytext=(tx, ty),
-                        color="white", fontsize=7.5, ha="center", va="center", zorder=8,
-                        bbox=dict(boxstyle="round,pad=0.45", fc="#0d2418", ec=col, lw=1.2),
-                        arrowprops=dict(arrowstyle="-", color=col, lw=1))
-        # nearest Order Block
-        obs = [o for o in order_blocks(full, atr) if o["i"] >= off]
-        ob = min(obs, key=lambda o: abs(px - (o["lo"] + o["hi"]) / 2), default=None)
-        if ob and not d.get("no_auto_ob"):
-            x0 = ob["i"] - off - 0.6
+                                   alpha=0.22, edgecolor=col, linewidth=0.9, zorder=1))
+            tag = "Bullish FVG" if f["side"] == "bull" else "Bearish FVG"
+            put(max(x0, 0) + 0.4, (f["lo"] + f["hi"]) / 2, tag, fs=7.5, color=col, ha="left",
+                va="center", fontweight="bold", zorder=7,
+                bbox=dict(boxstyle="round,pad=0.15", fc="#0d2418", ec="none", alpha=0.85))
+            if not callout_done:
+                callout_done = True
+                yl, yh = ax.get_ylim()
+                best = None
+                for cx in (n * 0.2, n * 0.4, n * 0.6):
+                    for cy in (yh - (yh - yl) * 0.12, yl + (yh - yl) * 0.12,
+                               (f["lo"] + f["hi"]) / 2 + (yh - yl) * 0.25,
+                               (f["lo"] + f["hi"]) / 2 - (yh - yl) * 0.25):
+                        if not (yl < cy < yh):
+                            continue
+                        band = (yh - yl) * 0.08
+                        hit = sum(1 for j, x in enumerate(c) if abs(j - cx) < 7
+                                  and x["l"] < cy + band and x["h"] > cy - band)
+                        score = (hit * 10 + abs(cx - (x0 + 2)) * 0.3
+                                 + abs(cy - (f["lo"] + f["hi"]) / 2) / (yh - yl) * 25)
+                        if best is None or score < best[0]:
+                            best = (score, cx, cy)
+                if best:
+                    ax.annotate("Fair Value Gap (FVG)\nInefficiency Zone - price\nlikely to return to fill",
+                                xy=(max(x0, 0) + 1.5, (f["lo"] + f["hi"]) / 2), xytext=(best[1], best[2]),
+                                color="white", fontsize=7.5, ha="center", va="center", zorder=8,
+                                bbox=dict(boxstyle="round,pad=0.45", fc="#0d2418", ec=col, lw=1.2),
+                                arrowprops=dict(arrowstyle="-", color=col, lw=1))
+        if not d.get("no_auto_fvg"):
+            shown.append(f"FVG {len(smc['fvg'])}" if smc["fvg"] else "FVG: none open near price")
+        # Order Blocks (bullish + bearish dono)
+        for ob in smc["ob"]:
+            x0 = max(ob["i"] - off - 0.6, -0.6)
             col = "#5fd35f" if ob["side"] == "bull" else "#ff9f1c"
-            w = min(n - x0, 14)
+            w = n - x0 - 0.4
             ax.add_patch(FancyBboxPatch((x0, ob["lo"]), w, ob["hi"] - ob["lo"],
                                         boxstyle="round,pad=0,rounding_size=0.6",
-                                        facecolor=col, alpha=0.16, edgecolor=col, lw=1.6, zorder=1))
-            ax.text(x0 + w / 2, (ob["lo"] + ob["hi"]) / 2,
-                    "Bullish Order Block" if ob["side"] == "bull" else "Bearish Order Block",
-                    color="white", fontsize=8, ha="center", va="center", fontweight="bold", zorder=7,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="#0d2418", ec="none", alpha=0.95))
+                                        facecolor=col, alpha=0.14, edgecolor=col, lw=1.6, zorder=1))
+            put(n * 0.55, (ob["lo"] + ob["hi"]) / 2,
+                "Bullish Order Block" if ob["side"] == "bull" else "Bearish Order Block",
+                fs=8, color="white", ha="center", va="center", fontweight="bold", zorder=7,
+                bbox=dict(boxstyle="round,pad=0.2", fc="#0d2418", ec=col, alpha=0.95))
+        if not d.get("no_auto_ob"):
+            shown.append(f"OB {len(smc['ob'])}" if smc["ob"] else "OB: none valid near price")
+        # Liquidity: equal highs / lows
+        for (_, v), lab, col in [(z, "$$$ EQH - Buy-side Liquidity", "#ff8a8a") for z in smc["eqh"]] + \
+                                [(z, "$$$ EQL - Sell-side Liquidity", "#8fe36b") for z in smc["eql"]]:
+            ax.hlines(v, -0.5, n, color=col, linewidth=1, linestyle="-.", alpha=0.9, zorder=2)
+            put(n * 0.3, v, lab, fs=7.5, color=col, ha="center", va="bottom",
+                fontweight="bold", zorder=6)
+        nl = len(smc["eqh"]) + len(smc["eql"])
+        shown.append(f"Liquidity {nl}" if nl else "Liquidity: none")
     except Exception as ex:
         print("smc overlay error:", ex, flush=True)
+    put(n - 0.5, eqp, "Equilibrium 50%", fs=7, color="#9fb5a8", ha="right", va="bottom", zorder=6)
+    # chart pe kya kya dikh raha hai (info strip)
+    ax.text(0.995, 0.985, "  ·  ".join(shown), transform=ax.transAxes, color="#cfd8d3",
+            fontsize=7.5, ha="right", va="top", zorder=9,
+            bbox=dict(boxstyle="round,pad=0.35", fc="#0d2418", ec="#2f5c43", alpha=0.9))
 
     # ---- extra boxes / lines (commands se) ----
     for i0, blo, bhi, bcol, blab in d.get("boxes", []):
@@ -521,7 +594,7 @@ def make_chart(d):
                 cur = nxt
         lines_.append(cur)
         fg = "#06120b" if acol in ("#0ecb81", "#8fe36b", "#ffd400") else "white"
-        fig.text(0.44, 0.075, "▶ NEXT ACTION\n" + "\n".join(lines_), color=fg, fontsize=15,
+        fig.text(0.44, 0.085, "▶ NEXT ACTION\n" + "\n".join(lines_), color=fg, fontsize=13.5,
                  fontweight="bold", ha="center", va="center", linespacing=1.25,
                  bbox=dict(boxstyle="round,pad=0.6", fc=acol, ec="white", lw=1.5))
     fig.text(0.96, 0.025, "SHAUSHAB", color="#8fe36b", fontsize=15,
@@ -1264,20 +1337,22 @@ def fvgs(c, atr):
     return out
 
 def order_blocks(c, atr):
-    # unmitigated OB: impulse se pehle ki ulti candle, price wapas nahi aaya
+    # OB: impulse se pehle ki ulti candle. Valid jab tak price uske paar close na kare.
     out = []
     for i in range(1, len(c) - 1):
         o, nx = c[i], c[i + 1]
         body = abs(nx["c"] - nx["o"])
-        if body < 1.2 * atr[i + 1]:
+        if body < 1.0 * atr[i + 1]:
             continue
         after = c[i + 2:]
         if o["c"] < o["o"] and nx["c"] > o["h"]:
-            if not any(x["l"] <= o["h"] for x in after):
-                out.append({"i": i, "side": "bull", "lo": o["l"], "hi": o["h"]})
+            if not any(x["c"] < o["l"] for x in after):
+                out.append({"i": i, "side": "bull", "lo": o["l"], "hi": o["h"],
+                            "tested": any(x["l"] <= o["h"] for x in after)})
         elif o["c"] > o["o"] and nx["c"] < o["l"]:
-            if not any(x["h"] >= o["l"] for x in after):
-                out.append({"i": i, "side": "bear", "lo": o["l"], "hi": o["h"]})
+            if not any(x["c"] > o["h"] for x in after):
+                out.append({"i": i, "side": "bear", "lo": o["l"], "hi": o["h"],
+                            "tested": any(x["h"] >= o["l"] for x in after)})
     return out
 
 def liquidity(c, hs, ls, atr):
