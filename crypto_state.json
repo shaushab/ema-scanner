@@ -13,7 +13,7 @@
    ],
    "hit": 2,
    "filled": true,
-   "chk": 1795694160,
+   "chk": 1795714920,
    "expire": 1795549500
   },
   {
@@ -29,7 +29,7 @@
    ],
    "hit": 1,
    "filled": true,
-   "chk": 1795694160,
+   "chk": 1795714920,
    "expire": 1795640400
   },
   {
@@ -45,7 +45,7 @@
    ],
    "hit": 1,
    "filled": true,
-   "chk": 1795694160,
+   "chk": 1795714920,
    "expire": 1795644900
   },
   {
@@ -61,24 +61,24 @@
    ],
    "hit": 0,
    "filled": true,
-   "chk": 1795694160,
+   "chk": 1795714920,
    "expire": 1795665600
   },
   {
-   "sym": "XAUUSDT",
-   "tf": "1",
-   "side": "BUY",
-   "entry": 3574.0,
-   "sl": 3564.347142857143,
+   "sym": "BTCUSDT",
+   "tf": "15",
+   "side": "SELL",
+   "entry": 60536.0,
+   "sl": 60861.025,
    "tps": [
-    3583.652857142857,
-    3593.305714285714,
-    3602.9585714285713
+    60210.975,
+    59885.95,
+    59560.924999999996
    ],
    "hit": 0,
    "filled": true,
-   "chk": 1795694160,
-   "expire": 1795692240
+   "chk": 1795714920,
+   "expire": 1795722300
   }
  ],
  "day": "2026-11-26",
@@ -93,12 +93,12 @@
    "cancel": 0
   },
   "BTCUSDT 1m": {
-   "signals": 5,
-   "filled": 5,
+   "signals": 7,
+   "filled": 7,
    "tp1": 4,
    "tp2": 2,
    "tp3": 2,
-   "sl": 2,
+   "sl": 4,
    "cancel": 0
   },
   "BTCUSDT 5m": {
@@ -111,21 +111,30 @@
    "cancel": 0
   },
   "BTCUSDT 15m": {
+   "signals": 3,
+   "filled": 3,
+   "tp1": 1,
+   "tp2": 0,
+   "tp3": 0,
+   "sl": 1,
+   "cancel": 0
+  },
+  "XAUUSDT 1m": {
+   "signals": 8,
+   "filled": 8,
+   "tp1": 5,
+   "tp2": 3,
+   "tp3": 0,
+   "sl": 3,
+   "cancel": 0
+  },
+  "XAUUSDT 5m": {
    "signals": 1,
    "filled": 1,
    "tp1": 1,
    "tp2": 0,
    "tp3": 0,
    "sl": 0,
-   "cancel": 0
-  },
-  "XAUUSDT 1m": {
-   "signals": 5,
-   "filled": 5,
-   "tp1": 3,
-   "tp2": 2,
-   "tp3": 0,
-   "sl": 1,
    "cancel": 0
   }
  },
@@ -141,14 +150,16 @@
   "New York|2026-11-25|close",
   "Tokyo|2026-11-26|open",
   "London|2026-11-26|open",
-  "Tokyo|2026-11-26|close"
+  "Tokyo|2026-11-26|close",
+  "New York|2026-11-26|open",
+  "London|2026-11-26|close"
  ],
  "last": {
-  "BTCUSDT|15": 1795692600,
-  "BTCUSDT|5": 1795693800,
-  "BTCUSDT|1": 1795694160,
-  "XAUUSDT|15": 1795692600,
-  "XAUUSDT|5": 1795693800,
-  "XAUUSDT|1": 1795694160
+  "BTCUSDT|15": 1795713300,
+  "BTCUSDT|5": 1795714500,
+  "BTCUSDT|1": 1795714920,
+  "XAUUSDT|15": 1795713300,
+  "XAUUSDT|5": 1795714500,
+  "XAUUSDT|1": 1795714920
  }
 }
