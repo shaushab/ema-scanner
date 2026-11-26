@@ -27,7 +27,9 @@ LIMIT_EXPIRE = 10      # limit entry itni candles me fill na ho to cancel
 STATE_FILE = "crypto_state.json"
 DXB = timezone(timedelta(hours=4))
 
-OKX_IDS = {"BTCUSDT": "BTC-USDT-SWAP", "XAUUSDT": "XAU-USDT-SWAP"}
+OKX_IDS = {"BTCUSDT": "BTC-USDT-SWAP", "XAUUSDT": "XAU-USDT-SWAP", "ETHUSDT": "ETH-USDT-SWAP"}
+CHOCH_SYMBOLS = ["BTCUSDT", "XAUUSDT", "ETHUSDT"]  # CHoCH alert in coins pe
+CHOCH_TFS = {"5": 300, "15": 900}
 
 def get_candles(sym, tf, sec):
     r = requests.get(
@@ -1230,6 +1232,40 @@ def session_alerts(st):
 
 CATCHUP = {"15": 8, "5": 6, "1": 0}  # restart ke gap me chhuti candles (15m: 2 ghante tak)
 
+def choch_check(st, sym, tf, sec, c):
+    # naya CHoCH (Change of Character) aaya to alert
+    key = f"{sym}|{tf}"
+    seen = st.setdefault("choch_seen", {})
+    if seen.get(key) == c[-1]["t"]:
+        return
+    first = key not in seen
+    seen[key] = c[-1]["t"]
+    trend, ev, hs, ls = structure(c)
+    if not ev or first:
+        return  # pehli baar sirf yaad rakho (restart pe purana alert nahi)
+    i, side, kind, lvl, si = ev[-1]
+    if kind != "CHoCH" or i != len(c) - 1:
+        return
+    bull = side == "bull"
+    px = c[-1]["c"]
+    act = ("TREND MAY TURN UP - WAIT FOR PULLBACK INTO BULLISH OB / FVG, THEN LOOK FOR BUY" if bull else
+           "TREND MAY TURN DOWN - WAIT FOR PULLBACK INTO BEARISH OB / FVG, THEN LOOK FOR SELL")
+    label = tf + "m"
+    when = datetime.fromtimestamp(c[-1]["t"] + sec, DXB).strftime("%I:%M %p").lstrip("0")
+    ch = chart_data(c, f"{sym} · {label} · {'BULLISH' if bull else 'BEARISH'} CHoCH")
+    ch["action"] = (act, "#0ecb81" if bull else "#e5484d")
+    html_ = (f"{'🟢' if bull else '🔴'} <b>CHANGE OF CHARACTER (CHoCH) · {sym}</b>  <i>({label})</i>\n"
+             f"━━━━━━━━━━━━━━\n"
+             f"▶️ <b>NEXT ACTION: {act}</b>\n━━━━━━━━━━━━━━\n"
+             f"{'⬆️ Bullish' if bull else '⬇️ Bearish'} CHoCH - price closed "
+             f"{'above the last Lower High' if bull else 'below the last Higher Low'}\n"
+             f"🧱 Level broken: <code>{lvl:.2f}</code>\n"
+             f"💰 Close: <code>{px:.2f}</code>\n"
+             f"🕒 Candle closed: {when} (Dubai)" + FOOT)
+    send(f"{'🟢' if bull else '🔴'} CHoCH {sym} ({label}): {'BULLISH' if bull else 'BEARISH'} "
+         f"- level {lvl:.2f} broken, close {px:.2f}\nNEXT ACTION: {act}", wa=True,
+         tg={"html": html_, "chart": ch})
+
 def process(st, htf, sym, tf, sec, c, late=False):
     # ek closed candle (c[-1]) pe saare signals check karo
     label = tf + "m"
@@ -1321,7 +1357,8 @@ def process(st, htf, sym, tf, sec, c, late=False):
 BARS = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
         "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1Dutc"}
 SYM_ALIAS = {"btc": "BTCUSDT", "bitcoin": "BTCUSDT", "btcusdt": "BTCUSDT",
-             "gold": "XAUUSDT", "xau": "XAUUSDT", "xauusdt": "XAUUSDT", "xauusd": "XAUUSDT"}
+             "gold": "XAUUSDT", "xau": "XAUUSDT", "xauusdt": "XAUUSDT", "xauusd": "XAUUSDT",
+             "eth": "ETHUSDT", "ethereum": "ETHUSDT", "ethusdt": "ETHUSDT"}
 
 def fetch(sym, bar, limit=300):
     r = requests.get("https://www.okx.com/api/v5/market/candles",
@@ -1475,7 +1512,7 @@ def head(sym, tf, title):
 
 def cmd_price(args):
     lines = ["<b>💰 Live Price</b>\n━━━━━━━━━━━━━━"]
-    for sym in SYMBOLS:
+    for sym in CHOCH_SYMBOLS:
         c = fetch(sym, "1d", 2)
         p, o = c[-1]["c"], c[-1]["o"]
         ch = (p - o) / o * 100
@@ -1849,7 +1886,7 @@ def cmd_stats(args):
 
 def cmd_help(args):
     h = ("<b>🤖 Shaushab Bot Commands</b>\n━━━━━━━━━━━━━━\n"
-         "<i>Symbol: btc / gold · Timeframe: 1m 5m 15m 1h 4h 1d</i>\n"
+         "<i>Symbol: btc / gold / eth · Timeframe: 1m 5m 15m 1h 4h 1d</i>\n"
          "<i>Example: /fvg gold 1h · /smc btc 4h</i>\n"
          "\n"
          "🧠 /smc — full SMC report + chart\n"
@@ -1861,7 +1898,7 @@ def cmd_help(args):
          "📊 /trend — trend from 5m to 1D + bias\n"
          "📈 /ema — EMA cross report (last + next cross time)\n"
          "📉 /chart — live chart\n"
-         "💰 /price — BTC + Gold price\n"
+         "💰 /price — BTC + Gold + ETH price\n"
          "🕒 /session — Tokyo / London / NY\n"
          "📂 /trades — open trades\n"
          "📅 /stats — today's results\n"
@@ -1878,7 +1915,7 @@ COMMANDS = {"smc": cmd_smc, "fvg": cmd_fvg, "ob": cmd_ob, "bos": cmd_bos, "choch
 MENU = [("smc", "SMC full report"), ("fvg", "Fair Value Gaps"), ("ob", "Order Blocks"),
         ("bos", "BOS / CHoCH"), ("liq", "Liquidity levels"), ("pd", "Premium / Discount"),
         ("trend", "Multi-timeframe trend"), ("ema", "EMA cross report"), ("chart", "Live chart"),
-        ("price", "BTC + Gold price"), ("session", "Sessions"), ("trades", "Open trades"),
+        ("price", "BTC + Gold + ETH price"), ("session", "Sessions"), ("trades", "Open trades"),
         ("stats", "Today's results"), ("status", "Bot status"), ("help", "All commands")]
 
 def _allowed_chats():
@@ -1973,6 +2010,14 @@ def main():
                     last[key] = c[-1]["t"]
                 except Exception as ex:
                     print(sym, tf, "error:", ex, flush=True)
+        for sym in CHOCH_SYMBOLS:  # CHoCH alerts: 5m + 15m
+            for tf, sec in CHOCH_TFS.items():
+                try:
+                    c = get_candles(sym, tf, sec)
+                    if c and len(c) > 50:
+                        choch_check(st, sym, tf, sec, c)
+                except Exception as ex:
+                    print("choch", sym, tf, "error:", ex, flush=True)
         if time.time() - last_save > 60:
             save_state(st)
             last_save = time.time()
