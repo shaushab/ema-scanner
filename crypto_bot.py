@@ -224,6 +224,8 @@ def _limits(d):
             ymin, ymax = min(ymin, min(d[key])), max(ymax, max(d[key]))
     for price, _, _ in d.get("levels", []):
         ymin, ymax = min(ymin, price), max(ymax, price)
+    for _, blo, bhi, _, _ in d.get("boxes", []):
+        ymin, ymax = min(ymin, blo), max(ymax, bhi)
     pad = (ymax - ymin) * 0.08 or 1
     return ymin - pad, ymax + pad
 
@@ -253,6 +255,23 @@ def _frame(d, k, show_levels, size=(9, 5.4), dpi=100):
         last = c[k - 1]["c"]
         tags.append((last, "PRICE", UP if c[k - 1]["c"] >= c[k - 1]["o"] else DN, "white"))
         ax.axhline(last, color="#848e9c", linewidth=0.8, linestyle=":")
+    for i0, blo, bhi, bcol, blab in d.get("boxes", []):  # FVG / OB boxes
+        x0 = max(i0, -0.5)
+        ax.add_patch(Rectangle((x0, blo), n - x0, bhi - blo, color=bcol, alpha=0.22, lw=0))
+        ax.text(x0 + 0.3, bhi, blab, color=bcol, fontsize=7, va="bottom", fontweight="bold")
+    for mi, mp, mt, mc in d.get("marks", []):  # BOS / CHoCH / swing marks
+        if 0 <= mi < n:
+            ax.annotate(mt, (mi, mp), color=mc, fontsize=7, ha="center", fontweight="bold",
+                        xytext=(0, 6 if mt.endswith("H") or "▲" in mt else -10),
+                        textcoords="offset points")
+    for x0, x1, y, slab, scol in d.get("segs", []):  # BOS/CHoCH line: swing se break tak
+        if x1 >= 0:
+            ax.hlines(y, max(x0, -0.5), x1, color=scol, linewidth=1.2, linestyle="--")
+            ax.text((max(x0, 0) + x1) / 2, y, slab, color=scol, fontsize=7, ha="center",
+                    va="bottom", fontweight="bold")
+    for y, ylab, ycol in d.get("hlines", []):  # liquidity / PDH / PDL lines
+        ax.axhline(y, color=ycol, linewidth=0.9, linestyle="-.", alpha=0.8)
+        ax.text(0.5, y, f" {ylab}", color=ycol, fontsize=7, va="bottom")
     if show_levels:
         if d.get("zone"):
             zl, zh = d["zone"]
@@ -472,14 +491,16 @@ def _post(item):
     text, tg = item
     tg = tg or {}
     cap = tg.get("html") or tg_plain(text)
+    chat = tg.get("chat") or CHAT
+    anim_ok = ANIMATION and not tg.get("static")
     sent = False
     for rm in ([_buttons(tg), {}] if tg.get("copy") else [{}]):  # buttons fail ho to bina buttons
         if sent:
             break
-        if CHARTS and tg.get("chart") and ANIMATION:
+        if CHARTS and tg.get("chart") and anim_ok:
             try:  # moving chart (GIF)
                 gif = make_anim(tg["chart"])
-                sent = _tg_call("sendAnimation", {"chat_id": CHAT, "caption": cap[:1024],
+                sent = _tg_call("sendAnimation", {"chat_id": chat, "caption": cap[:1024],
                                                   "parse_mode": "HTML", **rm},
                                 files={"animation": ("chart.gif", gif, "image/gif")})
             except Exception as ex:
@@ -487,28 +508,28 @@ def _post(item):
         if CHARTS and tg.get("chart") and not sent:
             try:
                 png = make_chart(tg["chart"])
-                sent = _tg_call("sendPhoto", {"chat_id": CHAT, "caption": cap[:1024],
+                sent = _tg_call("sendPhoto", {"chat_id": chat, "caption": cap[:1024],
                                               "parse_mode": "HTML", **rm},
                                 files={"photo": ("chart.png", png, "image/png")})
             except Exception as ex:
                 print("chart error:", ex, flush=True)
         if not sent:
-            sent = _tg_call("sendMessage", {"chat_id": CHAT, "text": cap, "parse_mode": "HTML", **rm})
+            sent = _tg_call("sendMessage", {"chat_id": chat, "text": cap, "parse_mode": "HTML", **rm})
     if not sent:  # HTML me masla ho to plain text
-        _tg_call("sendMessage", {"chat_id": CHAT, "text": text})
+        _tg_call("sendMessage", {"chat_id": chat, "text": text})
     if CHARTS and tg.get("sticker"):
         try:
             time.sleep(1.2)
             ok = False
             if ANIMATION:
                 try:
-                    ok = _tg_call("sendAnimation", {"chat_id": CHAT},
+                    ok = _tg_call("sendAnimation", {"chat_id": chat},
                                   files={"animation": ("shaushab.gif",
                                                        make_sticker_anim(tg["sticker"]), "image/gif")})
                 except Exception as ex:
                     print("sticker anim error:", ex, flush=True)
             if not ok:
-                _tg_call("sendSticker", {"chat_id": CHAT},
+                _tg_call("sendSticker", {"chat_id": chat},
                          files={"sticker": ("s.webp", make_sticker(tg["sticker"]), "image/webp")})
         except Exception as ex:
             print("sticker error:", ex, flush=True)
@@ -938,10 +959,488 @@ def process(st, htf, sym, tf, sec, c, late=False):
         if not limit:
             bump(st, f"{sym} {tf}m", "filled")
 
+# ---------- SMC analysis + Telegram commands (/fvg, /smc, /trend ...) ----------
+BARS = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1Dutc"}
+SYM_ALIAS = {"btc": "BTCUSDT", "bitcoin": "BTCUSDT", "btcusdt": "BTCUSDT",
+             "gold": "XAUUSDT", "xau": "XAUUSDT", "xauusdt": "XAUUSDT", "xauusd": "XAUUSDT"}
+
+def fetch(sym, bar, limit=300):
+    r = requests.get("https://www.okx.com/api/v5/market/candles",
+                     params={"instId": OKX_IDS[sym], "bar": BARS.get(bar, bar), "limit": limit},
+                     timeout=15)
+    r.raise_for_status()
+    j = r.json()
+    if j.get("code") != "0":
+        raise Exception("OKX: " + str(j.get("msg")))
+    return [{"t": int(x[0]) // 1000, "o": float(x[1]), "h": float(x[2]),
+             "l": float(x[3]), "c": float(x[4])} for x in j["data"][::-1]]
+
+def fmt(p):
+    return f"{p:,.2f}"
+
+def swings(c, k=3):
+    # fractal swing highs / lows (dono taraf k candles)
+    hs, ls = [], []
+    for i in range(k, len(c) - k):
+        win = c[i - k:i + k + 1]
+        if c[i]["h"] == max(x["h"] for x in win):
+            hs.append((i, c[i]["h"]))
+        if c[i]["l"] == min(x["l"] for x in win):
+            ls.append((i, c[i]["l"]))
+    return hs, ls
+
+def structure(c, k=3):
+    # BOS / CHoCH: close ne last swing high/low toda
+    hs, ls = swings(c, k)
+    events, trend = [], None
+    hi_i = lo_i = 0
+    last_h = last_l = None
+    used_h = used_l = None
+    for i in range(len(c)):
+        while hi_i < len(hs) and hs[hi_i][0] + k <= i:
+            last_h = hs[hi_i]
+            hi_i += 1
+        while lo_i < len(ls) and ls[lo_i][0] + k <= i:
+            last_l = ls[lo_i]
+            lo_i += 1
+        if last_h and last_h != used_h and c[i]["c"] > last_h[1]:
+            kind = "BOS" if trend == "bull" else "CHoCH"
+            events.append((i, "bull", kind, last_h[1], last_h[0]))
+            trend, used_h = "bull", last_h
+        if last_l and last_l != used_l and c[i]["c"] < last_l[1]:
+            kind = "BOS" if trend == "bear" else "CHoCH"
+            events.append((i, "bear", kind, last_l[1], last_l[0]))
+            trend, used_l = "bear", last_l
+    return trend, events, hs, ls
+
+def fvgs(c, atr):
+    # Fair Value Gaps jo abhi tak poore fill nahi hue
+    out = []
+    for i in range(2, len(c)):
+        a, b = c[i - 2], c[i]
+        if a["h"] < b["l"] and b["l"] - a["h"] >= 0.15 * atr[i]:
+            lo, hi, side = a["h"], b["l"], "bull"
+        elif a["l"] > b["h"] and a["l"] - b["h"] >= 0.15 * atr[i]:
+            lo, hi, side = b["h"], a["l"], "bear"
+        else:
+            continue
+        after = c[i + 1:]
+        if side == "bull":
+            if any(x["l"] <= lo for x in after):
+                continue
+            touched = min([x["l"] for x in after], default=hi)
+            fill = max(0.0, min(1.0, (hi - touched) / (hi - lo)))
+        else:
+            if any(x["h"] >= hi for x in after):
+                continue
+            touched = max([x["h"] for x in after], default=lo)
+            fill = max(0.0, min(1.0, (touched - lo) / (hi - lo)))
+        out.append({"i": i - 1, "side": side, "lo": lo, "hi": hi, "fill": fill})
+    return out
+
+def order_blocks(c, atr):
+    # unmitigated OB: impulse se pehle ki ulti candle, price wapas nahi aaya
+    out = []
+    for i in range(1, len(c) - 1):
+        o, nx = c[i], c[i + 1]
+        body = abs(nx["c"] - nx["o"])
+        if body < 1.2 * atr[i + 1]:
+            continue
+        after = c[i + 2:]
+        if o["c"] < o["o"] and nx["c"] > o["h"]:
+            if not any(x["l"] <= o["h"] for x in after):
+                out.append({"i": i, "side": "bull", "lo": o["l"], "hi": o["h"]})
+        elif o["c"] > o["o"] and nx["c"] < o["l"]:
+            if not any(x["h"] >= o["l"] for x in after):
+                out.append({"i": i, "side": "bear", "lo": o["l"], "hi": o["h"]})
+    return out
+
+def liquidity(c, hs, ls, atr):
+    # equal highs / equal lows (liquidity pools) jo abhi sweep nahi hue
+    tol = 0.12 * atr[-1]
+    eqh, eql = [], []
+    for j in range(len(hs)):
+        for m in range(j + 1, len(hs)):
+            if abs(hs[j][1] - hs[m][1]) <= tol:
+                lvl = max(hs[j][1], hs[m][1])
+                if not any(x["h"] > lvl for x in c[hs[m][0] + 1:]):
+                    eqh.append((hs[m][0], lvl))
+    for j in range(len(ls)):
+        for m in range(j + 1, len(ls)):
+            if abs(ls[j][1] - ls[m][1]) <= tol:
+                lvl = min(ls[j][1], ls[m][1])
+                if not any(x["l"] < lvl for x in c[ls[m][0] + 1:]):
+                    eql.append((ls[m][0], lvl))
+    return eqh[-2:], eql[-2:]
+
+def ema_trend(c):
+    cl = [x["c"] for x in c]
+    e20, e50, e200 = ema(cl, 20)[-1], ema(cl, 50)[-1], ema(cl, 200)[-1]
+    p = cl[-1]
+    if e20 > e50 > e200 and p > e50:
+        return "🟢 Bullish", e20, e50, e200
+    if e20 < e50 < e200 and p < e50:
+        return "🔴 Bearish", e20, e50, e200
+    return "⚪ Sideways", e20, e50, e200
+
+def parse_args(args, d_sym="BTCUSDT", d_tf="15m"):
+    sym, tf = d_sym, d_tf
+    for a in args:
+        a = a.lower()
+        if a in SYM_ALIAS:
+            sym = SYM_ALIAS[a]
+        elif a in BARS:
+            tf = a
+    return sym, tf
+
+def smc_pack(sym, tf):
+    c = fetch(sym, tf)
+    atr = atr_list(c)
+    trend, ev, hs, ls = structure(c)
+    return c, atr, trend, ev, hs, ls
+
+def chart_for(c, title, n=80, boxes=(), marks=(), hlines=(), segs=()):
+    d = chart_data(c, title, n=n)
+    off = len(c) - n
+    d["segs"] = [(a - off, b - off, y, t, col) for a, b, y, t, col in segs]
+    d["boxes"] = [(i - off, lo, hi, col, lab) for i, lo, hi, col, lab in boxes]
+    d["marks"] = [(i - off, p, t, col) for i, p, t, col in marks]
+    d["hlines"] = list(hlines)
+    return d
+
+def head(sym, tf, title):
+    return f"<b>{title}</b>\n🪙 <b>{sym}</b> · <i>{tf}</i>\n━━━━━━━━━━━━━━\n"
+
+def cmd_price(args):
+    lines = ["<b>💰 Live Price</b>\n━━━━━━━━━━━━━━"]
+    for sym in SYMBOLS:
+        c = fetch(sym, "1d", 2)
+        p, o = c[-1]["c"], c[-1]["o"]
+        ch = (p - o) / o * 100
+        lines.append(f"{'🟢' if ch >= 0 else '🔴'} <b>{sym}</b>: <code>{p:.2f}</code>  ({ch:+.2f}% aaj)")
+    return {"html": "\n".join(lines) + FOOT}
+
+def cmd_trend(args):
+    sym, _ = parse_args(args)
+    h = head(sym, "MTF", "📊 Multi-Timeframe Trend")
+    score = 0
+    for tf in ("5m", "15m", "1h", "4h", "1d"):
+        c = fetch(sym, tf)
+        lab, e20, e50, e200 = ema_trend(c)
+        st, ev, _, _ = structure(c)
+        stl = {"bull": "HH/HL ⬆️", "bear": "LH/LL ⬇️"}.get(st, "-")
+        score += (1 if "Bull" in lab else -1 if "Bear" in lab else 0) + \
+                 (1 if st == "bull" else -1 if st == "bear" else 0)
+        h += f"<b>{tf:>3}</b>: {lab} | Structure {stl}\n"
+    bias = "🟢 BUY side" if score >= 3 else "🔴 SELL side" if score <= -3 else "⚪ Mixed / wait"
+    h += f"━━━━━━━━━━━━━━\n🧭 <b>Overall bias:</b> {bias}  <i>(score {score:+d})</i>"
+    return {"html": h + FOOT}
+
+def cmd_ema(args):
+    sym, tf = parse_args(args)
+    c = fetch(sym, tf)
+    lab, e20, e50, e200 = ema_trend(c)
+    p = c[-1]["c"]
+    h = head(sym, tf, "📈 EMA Status")
+    for n_, v in (("EMA 20", e20), ("EMA 50", e50), ("EMA 200", e200)):
+        h += f"{n_}: <code>{v:.2f}</code>  ({(p - v) / v * 100:+.2f}%)\n"
+    h += f"Price: <code>{p:.2f}</code>\nTrend: {lab}"
+    return {"html": h + FOOT, "chart": chart_data(c, f"{sym} · {tf} · EMA"), "static": True}
+
+def cmd_fvg(args):
+    sym, tf = parse_args(args)
+    c, atr, *_ = smc_pack(sym, tf)
+    p = c[-1]["c"]
+    fv = fvgs(c, atr)
+    bull = sorted([f for f in fv if f["side"] == "bull"], key=lambda f: p - f["hi"])[:3]
+    bear = sorted([f for f in fv if f["side"] == "bear"], key=lambda f: f["lo"] - p)[:3]
+    h = head(sym, tf, "🕳 Fair Value Gaps (unfilled)")
+    h += "🟢 <b>Bullish FVG</b> (support, neeche):\n"
+    h += "".join(f"  • <code>{f['lo']:.2f} - {f['hi']:.2f}</code>  ({f['fill'] * 100:.0f}% filled)\n"
+                 for f in bull) or "  koi nahi\n"
+    h += "🔴 <b>Bearish FVG</b> (resistance, upar):\n"
+    h += "".join(f"  • <code>{f['lo']:.2f} - {f['hi']:.2f}</code>  ({f['fill'] * 100:.0f}% filled)\n"
+                 for f in bear) or "  koi nahi\n"
+    h += f"Price: <code>{p:.2f}</code>"
+    boxes = [(f["i"], f["lo"], f["hi"], UP if f["side"] == "bull" else DN, "FVG")
+             for f in bull + bear if f["i"] >= len(c) - 80]
+    return {"html": h + FOOT, "static": True,
+            "chart": chart_for(c, f"{sym} · {tf} · FVG", boxes=boxes)}
+
+def cmd_ob(args):
+    sym, tf = parse_args(args)
+    c, atr, *_ = smc_pack(sym, tf)
+    p = c[-1]["c"]
+    obs = order_blocks(c, atr)
+    bull = sorted([o for o in obs if o["side"] == "bull"], key=lambda o: p - o["hi"])[:3]
+    bear = sorted([o for o in obs if o["side"] == "bear"], key=lambda o: o["lo"] - p)[:3]
+    h = head(sym, tf, "🧱 Order Blocks (unmitigated)")
+    h += "🟢 <b>Bullish OB</b> (demand):\n"
+    h += "".join(f"  • <code>{o['lo']:.2f} - {o['hi']:.2f}</code>\n" for o in bull) or "  koi nahi\n"
+    h += "🔴 <b>Bearish OB</b> (supply):\n"
+    h += "".join(f"  • <code>{o['lo']:.2f} - {o['hi']:.2f}</code>\n" for o in bear) or "  koi nahi\n"
+    h += f"Price: <code>{p:.2f}</code>"
+    boxes = [(o["i"], o["lo"], o["hi"], "#3d7dff" if o["side"] == "bull" else "#ff9f1c", "OB")
+             for o in bull + bear if o["i"] >= len(c) - 80]
+    return {"html": h + FOOT, "static": True,
+            "chart": chart_for(c, f"{sym} · {tf} · Order Blocks", boxes=boxes)}
+
+def cmd_bos(args):
+    sym, tf = parse_args(args)
+    c, atr, trend, ev, hs, ls = smc_pack(sym, tf)
+    h = head(sym, tf, "🏗 Market Structure (BOS / CHoCH)")
+    h += f"Trend: <b>{'🟢 Bullish' if trend == 'bull' else '🔴 Bearish' if trend == 'bear' else '⚪ -'}</b>\n"
+    for i, side, kind, lvl, _ in ev[-5:][::-1]:
+        ago = (c[-1]["t"] - c[i]["t"]) / 3600
+        h += f"{'⬆️' if side == 'bull' else '⬇️'} <b>{kind}</b> @ <code>{lvl:.2f}</code>  <i>{ago:.1f} ghante pehle</i>\n"
+    if hs:
+        h += f"Last swing high: <code>{hs[-1][1]:.2f}</code>\n"
+    if ls:
+        h += f"Last swing low: <code>{ls[-1][1]:.2f}</code>"
+    segs = [(si, i, lvl, kind, UP if side == "bull" else DN) for i, side, kind, lvl, si in ev[-6:]]
+    return {"html": h + FOOT, "static": True,
+            "chart": chart_for(c, f"{sym} · {tf} · Structure", segs=segs)}
+
+def day_levels(sym):
+    d = fetch(sym, "1d", 3)
+    return d[-2]["h"], d[-2]["l"], d[-1]["o"], d[-1]["t"]
+
+def asia_range(sym):
+    c = fetch(sym, "15m", 96)
+    now = datetime.now(timezone.utc)
+    op, cl = sess_times("Asia/Tokyo", 9, 18, now)
+    if now < op:
+        op, cl = op - timedelta(days=1), cl - timedelta(days=1)
+    w = [x for x in c if op.timestamp() <= x["t"] < cl.timestamp()]
+    if not w:
+        return None
+    return max(x["h"] for x in w), min(x["l"] for x in w)
+
+def cmd_liq(args):
+    sym, tf = parse_args(args)
+    c, atr, trend, ev, hs, ls = smc_pack(sym, tf)
+    p = c[-1]["c"]
+    eqh, eql = liquidity(c, hs, ls, atr)
+    pdh, pdl, dop, dstart = day_levels(sym)
+    today = [x for x in c if x["t"] >= dstart] or c[-1:]
+    ar = asia_range(sym)
+    h = head(sym, tf, "💧 Liquidity Levels")
+    h += f"📅 PDH (kal ka high): <code>{pdh:.2f}</code> {'✅ aaj sweep hua' if max(x['h'] for x in today) > pdh else ''}\n"
+    h += f"📅 PDL (kal ka low): <code>{pdl:.2f}</code> {'✅ aaj sweep hua' if min(x['l'] for x in today) < pdl else ''}\n"
+    h += f"🕛 Aaj ka open: <code>{dop:.2f}</code>\n"
+    if ar:
+        h += f"🇯🇵 Asia high/low: <code>{ar[0]:.2f}</code> / <code>{ar[1]:.2f}</code>\n"
+    h += "🔺 Equal highs (buy-side liq): " + (", ".join(f"<code>{v:.2f}</code>" for _, v in eqh) or "-") + "\n"
+    h += "🔻 Equal lows (sell-side liq): " + (", ".join(f"<code>{v:.2f}</code>" for _, v in eql) or "-") + "\n"
+    h += f"Price: <code>{p:.2f}</code>"
+    hl = [(pdh, "PDH", "#ffd400"), (pdl, "PDL", "#ffd400")] + \
+         [(v, "EQH", "#f6465d") for _, v in eqh] + [(v, "EQL", "#0ecb81") for _, v in eql]
+    if ar:
+        hl += [(ar[0], "Asia H", "#c4b5fd"), (ar[1], "Asia L", "#c4b5fd")]
+    lo_c, hi_c = min(x["l"] for x in c[-80:]), max(x["h"] for x in c[-80:])
+    rng = hi_c - lo_c
+    hl = [x for x in hl if lo_c - rng * 0.5 <= x[0] <= hi_c + rng * 0.5]
+    return {"html": h + FOOT, "static": True,
+            "chart": chart_for(c, f"{sym} · {tf} · Liquidity", hlines=hl)}
+
+def cmd_pd(args):
+    sym, tf = parse_args(args)
+    c = fetch(sym, tf)
+    w = c[-100:]
+    hi, lo = max(x["h"] for x in w), min(x["l"] for x in w)
+    eq = (hi + lo) / 2
+    p = c[-1]["c"]
+    pos = (p - lo) / (hi - lo) * 100 if hi > lo else 50
+    zone = "🔴 PREMIUM (mehnga, SELL zone)" if pos > 55 else "🟢 DISCOUNT (sasta, BUY zone)" if pos < 45 else "⚪ Equilibrium (beech)"
+    h = head(sym, tf, "⚖️ Premium / Discount")
+    h += (f"Range high: <code>{hi:.2f}</code>\nEquilibrium (50%): <code>{eq:.2f}</code>\n"
+          f"Range low: <code>{lo:.2f}</code>\n"
+          f"OTE (62–79%): <code>{hi - (hi - lo) * 0.62:.2f}</code> – <code>{hi - (hi - lo) * 0.79:.2f}</code> (buy) | "
+          f"<code>{lo + (hi - lo) * 0.62:.2f}</code> – <code>{lo + (hi - lo) * 0.79:.2f}</code> (sell)\n"
+          f"Price: <code>{p:.2f}</code> → range ka <b>{pos:.0f}%</b>\n{zone}")
+    hl = [(hi, "Range H", "#848e9c"), (eq, "EQ 50%", "#ffd400"), (lo, "Range L", "#848e9c")]
+    boxes = [(len(c) - 100, eq, hi, DN, "PREMIUM"), (len(c) - 100, lo, eq, UP, "DISCOUNT")]
+    return {"html": h + FOOT, "static": True,
+            "chart": chart_for(c, f"{sym} · {tf} · Premium/Discount", boxes=boxes, hlines=hl)}
+
+def cmd_smc(args):
+    sym, tf = parse_args(args)
+    c, atr, trend, ev, hs, ls = smc_pack(sym, tf)
+    p = c[-1]["c"]
+    lab, e20, e50, e200 = ema_trend(c)
+    fv = fvgs(c, atr)
+    obs = order_blocks(c, atr)
+    eqh, eql = liquidity(c, hs, ls, atr)
+    w = c[-100:]
+    hi, lo = max(x["h"] for x in w), min(x["l"] for x in w)
+    pos = (p - lo) / (hi - lo) * 100 if hi > lo else 50
+    nb_f = min([f for f in fv if f["side"] == "bull"], key=lambda f: p - f["hi"], default=None)
+    ns_f = min([f for f in fv if f["side"] == "bear"], key=lambda f: f["lo"] - p, default=None)
+    nb_o = min([o for o in obs if o["side"] == "bull"], key=lambda o: p - o["hi"], default=None)
+    ns_o = min([o for o in obs if o["side"] == "bear"], key=lambda o: o["lo"] - p, default=None)
+    h = head(sym, tf, "🧠 SMC Full Report")
+    h += f"📈 EMA trend: {lab}\n"
+    h += f"🏗 Structure: {'🟢 Bullish' if trend == 'bull' else '🔴 Bearish' if trend == 'bear' else '-'}"
+    if ev:
+        i, side, kind, lvl, _ = ev[-1]
+        h += f" (last {kind} {'⬆️' if side == 'bull' else '⬇️'} @ <code>{lvl:.2f}</code>)"
+    h += "\n"
+    h += f"⚖️ Range position: <b>{pos:.0f}%</b> {'(Premium)' if pos > 55 else '(Discount)' if pos < 45 else '(EQ)'}\n"
+    if nb_f:
+        h += f"🕳🟢 Nearest bull FVG: <code>{nb_f['lo']:.2f} - {nb_f['hi']:.2f}</code>\n"
+    if ns_f:
+        h += f"🕳🔴 Nearest bear FVG: <code>{ns_f['lo']:.2f} - {ns_f['hi']:.2f}</code>\n"
+    if nb_o:
+        h += f"🧱🟢 Demand OB: <code>{nb_o['lo']:.2f} - {nb_o['hi']:.2f}</code>\n"
+    if ns_o:
+        h += f"🧱🔴 Supply OB: <code>{ns_o['lo']:.2f} - {ns_o['hi']:.2f}</code>\n"
+    if eqh:
+        h += f"💧 Buy-side liq (EQH): <code>{eqh[-1][1]:.2f}</code>\n"
+    if eql:
+        h += f"💧 Sell-side liq (EQL): <code>{eql[-1][1]:.2f}</code>\n"
+    bull_pts = ("Bull" in lab) + (trend == "bull") + (pos < 45)
+    bear_pts = ("Bear" in lab) + (trend == "bear") + (pos > 55)
+    if bull_pts >= 2 and bull_pts > bear_pts:
+        idea = "🟢 Bias BUY — discount zone ke demand OB / bull FVG pe pullback ka wait karo"
+    elif bear_pts >= 2 and bear_pts > bull_pts:
+        idea = "🔴 Bias SELL — premium zone ke supply OB / bear FVG pe pullback ka wait karo"
+    else:
+        idea = "⚪ Clear bias nahi — wait karo ya chhota size"
+    h += f"━━━━━━━━━━━━━━\n🧭 {idea}\nPrice: <code>{p:.2f}</code>"
+    boxes = []
+    for f, col in ((nb_f, UP), (ns_f, DN)):
+        if f and f["i"] >= len(c) - 80:
+            boxes.append((f["i"], f["lo"], f["hi"], col, "FVG"))
+    for o, col in ((nb_o, "#3d7dff"), (ns_o, "#ff9f1c")):
+        if o and o["i"] >= len(c) - 80:
+            boxes.append((o["i"], o["lo"], o["hi"], col, "OB"))
+    segs = [(si, i, lvl, kind, UP if side == "bull" else DN) for i, side, kind, lvl, si in ev[-4:]]
+    hl = [(v, "EQH", "#f6465d") for _, v in eqh[-1:]] + [(v, "EQL", "#0ecb81") for _, v in eql[-1:]]
+    return {"html": h + FOOT, "static": True,
+            "chart": chart_for(c, f"{sym} · {tf} · SMC", boxes=boxes, segs=segs, hlines=hl)}
+
+def cmd_chart(args):
+    sym, tf = parse_args(args)
+    c = fetch(sym, tf)
+    return {"html": head(sym, tf, "📉 Live Chart") + f"Price: <code>{c[-1]['c']:.2f}</code>" + FOOT,
+            "chart": chart_data(c, f"{sym} · {tf}")}
+
+def cmd_session(args):
+    return {"html": tg_plain(sessions_text())}
+
+def cmd_status(args):
+    lines = [html.escape(status_15m())]
+    return {"html": "<b>📊 Bot status</b>\n" + "\n".join(lines) + FOOT}
+
+_STATE_REF = {}
+
+def cmd_trades(args):
+    st = _STATE_REF.get("st") or {}
+    tr = st.get("trades", [])
+    if not tr:
+        return {"html": "<b>📂 Open trades</b>\nAbhi koi open trade nahi." + FOOT}
+    h = "<b>📂 Open trades</b>\n━━━━━━━━━━━━━━\n"
+    for t in tr[-10:]:
+        h += (f"{'🟢' if t['side'] == 'BUY' else '🔴'} {t['sym']} ({t['tf']}m) {t['side']} "
+              f"@ <code>{t['entry']:.2f}</code> | SL <code>{t['sl']:.2f}</code> | "
+              f"{'TP' + str(t['hit']) + ' hit' if t['hit'] else ('active' if t['filled'] else 'limit wait')}\n")
+    return {"html": h.rstrip() + FOOT}
+
+def cmd_stats(args):
+    st = _STATE_REF.get("st") or {}
+    return {"html": tg_plain(summary_text(st.get("day", "aaj"), st.get("stats", {})))}
+
+def cmd_help(args):
+    h = ("<b>🤖 Shaushab Bot Commands</b>\n━━━━━━━━━━━━━━\n"
+         "<i>Symbol: btc / gold · Timeframe: 1m 5m 15m 1h 4h 1d</i>\n"
+         "<i>Example: /fvg gold 1h · /smc btc 4h</i>\n\n"
+         "🧠 /smc — poora SMC report + chart\n"
+         "🕳 /fvg — Fair Value Gaps\n"
+         "🧱 /ob — Order Blocks\n"
+         "🏗 /bos — BOS / CHoCH structure\n"
+         "💧 /liq — Liquidity (PDH/PDL, EQH/EQL, Asia range)\n"
+         "⚖️ /pd — Premium / Discount + OTE\n"
+         "📊 /trend — 5m se 1D tak trend + bias\n"
+         "📈 /ema — EMA 20/50/200\n"
+         "📉 /chart — live moving chart\n"
+         "💰 /price — BTC + Gold price\n"
+         "🕒 /session — Tokyo / London / NY\n"
+         "📂 /trades — open trades\n"
+         "📅 /stats — aaj ka hisaab\n"
+         "🟢 /status — 15m status")
+    return {"html": h + FOOT}
+
+COMMANDS = {"smc": cmd_smc, "fvg": cmd_fvg, "ob": cmd_ob, "bos": cmd_bos, "choch": cmd_bos,
+            "structure": cmd_bos, "liq": cmd_liq, "liquidity": cmd_liq, "pd": cmd_pd,
+            "premium": cmd_pd, "discount": cmd_pd, "trend": cmd_trend, "ema": cmd_ema,
+            "chart": cmd_chart, "price": cmd_price, "session": cmd_session,
+            "trades": cmd_trades, "stats": cmd_stats, "status": cmd_status,
+            "help": cmd_help, "start": cmd_help}
+
+MENU = [("smc", "SMC full report"), ("fvg", "Fair Value Gaps"), ("ob", "Order Blocks"),
+        ("bos", "BOS / CHoCH"), ("liq", "Liquidity levels"), ("pd", "Premium / Discount"),
+        ("trend", "Multi-timeframe trend"), ("ema", "EMA 20/50/200"), ("chart", "Live chart"),
+        ("price", "BTC + Gold price"), ("session", "Sessions"), ("trades", "Open trades"),
+        ("stats", "Aaj ka hisaab"), ("status", "Bot status"), ("help", "Saare commands")]
+
+def _allowed_chats():
+    return {x for x in (CHAT, os.environ.get("TELEGRAM_CHAT_15M", "").strip()) if x}
+
+def handle_command(text, chat):
+    parts = text.strip().split()
+    cmd = parts[0][1:].split("@")[0].lower()
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        return
+    try:
+        tg = fn(parts[1:])
+    except Exception as ex:
+        print("command error:", cmd, ex, flush=True)
+        tg = {"html": f"⚠️ /{html.escape(cmd)} abhi nahi chala, thodi der baad try karo."}
+    tg["chat"] = chat
+    _q.put((f"/{cmd}", tg))
+
+def _cmd_worker():
+    # Telegram se /commands padhna (long polling)
+    try:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/setMyCommands",
+                      json={"commands": [{"command": a, "description": b} for a, b in MENU]},
+                      timeout=20)
+    except Exception as ex:
+        print("setMyCommands error:", ex, flush=True)
+    offset = None
+    allowed = _allowed_chats()
+    while True:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+                             params={"timeout": 25, "offset": offset,
+                                     "allowed_updates": json.dumps(["message", "channel_post"])},
+                             timeout=40)
+            if r.status_code != 200:
+                print("getUpdates error:", r.status_code, r.text[:200], flush=True)
+                time.sleep(10)
+                continue
+            for u in r.json().get("result", []):
+                offset = u["update_id"] + 1
+                m = u.get("message") or u.get("channel_post") or {}
+                text = m.get("text") or ""
+                chat = str(m.get("chat", {}).get("id", ""))
+                if not text.startswith("/") or chat not in allowed:
+                    continue  # sirf apne group/chat ke commands
+                if time.time() - m.get("date", 0) > 600:
+                    continue  # 10 min se purana command chhod do
+                handle_command(text, chat)
+        except Exception as ex:
+            print("command loop error:", ex, flush=True)
+            time.sleep(5)
+
 def main():
     start = time.time()
     print("bot started", flush=True)
     st = load_state()
+    _STATE_REF["st"] = st
+    threading.Thread(target=_cmd_worker, daemon=True).start()  # /commands
     last = st.setdefault("last", {})  # "SYM|tf" -> aakhri check ki hui candle ka time
     send("✅ Crypto bot chalu hai: BTC + Gold (1m, 5m, 15m)\n\n"
          + status_15m() + "\n\n" + sessions_text()
